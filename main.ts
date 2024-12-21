@@ -74,8 +74,8 @@ export default class MyPlugin extends Plugin {
 
 	async onload() {
 
-		this.addCommand({id: 'modal', name: 'Open modal', callback: ()=>this.openStatusChangeModal()})
-		this.addRibbonIcon('dice', 'Jon ribbon', ()=>this.openStatusChangeModal())
+		this.addCommand({id: 'modal', name: 'Set status', callback: ()=>this.openStatusChangeModal()})
+		this.addRibbonIcon('circle-check', 'Set status', ()=>this.openStatusChangeModal())
 	}
 
 	openStatusChangeModal() {
