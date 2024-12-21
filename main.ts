@@ -8,7 +8,7 @@ interface DocumentData {
 	originalYaml?: yaml.Document;
 }
 
-const STATUS_CHOICES = ['complete', 'abandoned', 'backlog'] as const
+const STATUS_CHOICES = ['complete', 'abandoned', 'backlog', 'in progress'] as const
 type Status = typeof STATUS_CHOICES[number];
 
 function extractFrontmatter(markdown: string): DocumentData {
