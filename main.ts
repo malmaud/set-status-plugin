@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Editor, FuzzySuggestModal, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import * as yaml from 'yaml'
 import * as datefns from 'date-fns'
 
@@ -8,8 +8,12 @@ interface DocumentData {
 	originalYaml?: yaml.Document;
 }
 
-const STATUS_CHOICES = ['complete', 'abandoned', 'backlog', 'in progress'] as const
-type Status = typeof STATUS_CHOICES[number];
+interface Status {
+    name: string;
+}
+
+const STATUS_NAMES = ['complete', 'abandoned', 'backlog', 'in progress'] as const
+const STATUS_CHOICES = STATUS_NAMES.map(name=>{return {name: name}}) as Status[]
 
 function extractFrontmatter(markdown: string): DocumentData {
     // Default return value for documents without frontmatter
@@ -79,7 +83,7 @@ export default class MyPlugin extends Plugin {
 	}
 
 	openStatusChangeModal() {
-		new ChoiceModal(this.app, this.setStatus).open();
+		new ChoiceModal(this.app, this.setStatus.bind(this)).open();
 	}
 
 	async setStatus(status: Status) {
@@ -99,7 +103,7 @@ export default class MyPlugin extends Plugin {
 		const data = extractFrontmatter(content)
 		console.log(`frontmatter: ${JSON.stringify(data.frontmatter)}`)
 
-		data.frontmatter['status'] = status
+		data.frontmatter['status'] = status.name
 
 		const formattedDate = datefns.format(new Date(), 'yyyy-MM-dd')
 		data.frontmatter['status date'] = formattedDate
@@ -112,47 +116,24 @@ export default class MyPlugin extends Plugin {
 
 	}
 
-
 }
 
-
-class ChoiceModal extends Modal {
-    result: Status | null = null;
-	onSubmit: (choice: Status)=>Promise<void>;
-
+class ChoiceModal extends FuzzySuggestModal<Status> {
+    onSubmit: (choice: Status)=>Promise<void>;
     constructor(app: App, onSubmit: (choice: Status)=>Promise<void>) {
         super(app);
 		this.onSubmit = onSubmit
     }
 
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.empty();
-
-        contentEl.createEl('h2', { text: 'Set status' });
-
-        const buttonContainer = contentEl.createDiv('button-container');
-        buttonContainer.style.display = 'flex';
-        buttonContainer.style.flexDirection = 'column';
-        buttonContainer.style.gap = '8px';
-
-        STATUS_CHOICES.forEach(choice => {
-            const btn = buttonContainer.createEl('button', { text: choice });
-            btn.addEventListener('click', async () => {
-                this.result = choice;
-				await this.onSubmit(this.result);
-                this.close();
-            });
-        });
+    getItems(): Status[] {
+        return STATUS_CHOICES;
     }
 
-    onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
-        
-        if (this.result) {
-            console.log(`Selected choice: ${this.result}`);
-        }
+    getItemText(status: Status): string {
+        return status.name
+    }
+
+    onChooseItem(status: Status, evt: MouseEvent | KeyboardEvent) {
+        this.onSubmit(status)
     }
 }
-
