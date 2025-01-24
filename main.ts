@@ -16,19 +16,22 @@ interface Status {
 	name: string;
 }
 
-const STATUS_NAMES = [
-	"complete",
-	"abandoned",
-	"backlog",
-	"in progress",
-] as const;
+interface Settings {
+	statusNames: string[];
+}
 
-const STATUS_CHOICES = STATUS_NAMES.map((name) => {
-	return { name: name };
-}) as Status[];
+const DEFAULT_SETTINGS: Settings = {
+	statusNames: ["complete", "abandoned", "backlog", "in progress"],
+};
 
 export default class MyPlugin extends Plugin {
+	settings: Settings;
+
 	async onload() {
+		console.log("loaded status updates");
+
+		await this.loadSettings();
+		console.log("Settings:", this.settings);
 		this.addCommand({
 			id: "modal",
 			name: "Set status",
@@ -46,10 +49,33 @@ export default class MyPlugin extends Plugin {
 		this.addRibbonIcon("circle-check", "Set status", () =>
 			this.openStatusChangeModal()
 		);
+
+		this.addSettingTab(new SettingsTab(this.app, this));
+	}
+
+	async loadSettings(): Promise<Settings> {
+		const settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			await this.loadData()
+		);
+		this.settings = settings;
+		return settings;
+	}
+
+	async saveSettings(): Promise<void> {
+		await this.saveData(this.settings);
 	}
 
 	openStatusChangeModal() {
-		new ChoiceModal(this.app, this.setStatus.bind(this)).open();
+		const statusChoices = this.settings.statusNames.map((name) => {
+			return { name };
+		});
+		new ChoiceModal(
+			this.app,
+			this.setStatus.bind(this),
+			statusChoices
+		).open();
 	}
 
 	async setStatus(status: Status) {
@@ -83,13 +109,19 @@ export default class MyPlugin extends Plugin {
 
 class ChoiceModal extends FuzzySuggestModal<Status> {
 	onSubmit: (choice: Status) => Promise<void>;
-	constructor(app: App, onSubmit: (choice: Status) => Promise<void>) {
+	statusChoices: Status[];
+	constructor(
+		app: App,
+		onSubmit: (choice: Status) => Promise<void>,
+		statusChoices: Status[]
+	) {
 		super(app);
 		this.onSubmit = onSubmit;
+		this.statusChoices = statusChoices;
 	}
 
 	getItems(): Status[] {
-		return STATUS_CHOICES;
+		return this.statusChoices;
 	}
 
 	getItemText(status: Status): string {
@@ -98,5 +130,47 @@ class ChoiceModal extends FuzzySuggestModal<Status> {
 
 	onChooseItem(status: Status, evt: MouseEvent | KeyboardEvent) {
 		this.onSubmit(status);
+	}
+}
+
+class SettingsTab extends PluginSettingTab {
+	plugin: MyPlugin;
+
+	constructor(app: App, plugin: MyPlugin) {
+		super(app, plugin);
+		this.plugin = plugin;
+	}
+
+	getStatuses(): string {
+		return this.plugin.settings.statusNames.join("\n");
+	}
+
+	async setStatuses(text: string): Promise<void> {
+		const statuses = text
+			.split("\n")
+			.map((s) => {
+				return s.trim();
+			})
+			.filter((s) => s.length > 0);
+		this.plugin.settings.statusNames = statuses;
+		await this.plugin.saveSettings();
+	}
+
+	display(): void {
+		let containerEl = this.containerEl;
+		containerEl.empty();
+		new Setting(containerEl)
+			.setName("Status options")
+			.addTextArea((text) => {
+				text.setPlaceholder("Status options")
+					.setValue(this.getStatuses())
+					.onChange(async (value) => {
+						await this.setStatuses(value);
+					})
+					.then((text) => {
+						text.inputEl.style.width = "100%";
+						text.inputEl.rows = 10;
+					});
+			});
 	}
 }
