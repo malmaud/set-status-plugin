@@ -18,10 +18,12 @@ interface Status {
 
 interface Settings {
 	statusNames: string[];
+	dateFormat: string;
 }
 
 const DEFAULT_SETTINGS: Settings = {
 	statusNames: ["complete", "abandoned", "backlog", "in progress"],
+	dateFormat: "yyyy-MM-dd",
 };
 
 export default class MyPlugin extends Plugin {
@@ -97,7 +99,10 @@ export default class MyPlugin extends Plugin {
 
 		data.frontmatter["status"] = status.name;
 
-		const formattedDate = datefns.format(new Date(), "yyyy-MM-dd");
+		const formattedDate = datefns.format(
+			new Date(),
+			this.settings.dateFormat
+		);
 		data.frontmatter["status date"] = formattedDate;
 
 		const markdown = convertToMarkdown(data);
@@ -156,6 +161,15 @@ class SettingsTab extends PluginSettingTab {
 		await this.plugin.saveSettings();
 	}
 
+	getDateFormat(): string {
+		return this.plugin.settings.dateFormat;
+	}
+
+	async setDateFormat(value: string): Promise<void> {
+		this.plugin.settings.dateFormat = value;
+		await this.plugin.saveSettings();
+	}
+
 	display(): void {
 		let containerEl = this.containerEl;
 		containerEl.empty();
@@ -172,5 +186,10 @@ class SettingsTab extends PluginSettingTab {
 						text.inputEl.rows = 10;
 					});
 			});
+		new Setting(containerEl).setName("Date format").addText((text) => {
+			text.setPlaceholder("yyyy-MM-dd")
+				.setValue(this.getDateFormat())
+				.onChange(async (value) => await this.setDateFormat(value));
+		});
 	}
 }
