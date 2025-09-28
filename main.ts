@@ -22,7 +22,7 @@ interface Settings {
 }
 
 const DEFAULT_SETTINGS: Settings = {
-	statusNames: ["complete", "abandoned", "backlog", "in progress"],
+	statusNames: ["complete", "abandoned", "backlog", "on radar", "in progress"],
 	dateFormat: "yyyy-MM-dd",
 };
 
