@@ -1,9 +1,6 @@
 import {
 	App,
-	Editor,
 	FuzzySuggestModal,
-	MarkdownView,
-	Modal,
 	Notice,
 	Plugin,
 	PluginSettingTab,
@@ -171,7 +168,7 @@ class SettingsTab extends PluginSettingTab {
 	}
 
 	display(): void {
-		let containerEl = this.containerEl;
+		const containerEl = this.containerEl;
 		containerEl.empty();
 		new Setting(containerEl)
 			.setName("Status options")
