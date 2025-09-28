@@ -11,7 +11,7 @@ import {
 } from "obsidian";
 import * as datefns from "date-fns";
 import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
-import { fetchGameThumbnail, requestIgdbAccessToken } from "./igdb";
+import { fetchGameMetadata, requestIgdbAccessToken } from "./igdb";
 
 interface Status {
 	name: string;
@@ -68,6 +68,9 @@ export default class MyPlugin extends Plugin {
 		this.addRibbonIcon("circle-check", "Set status", () =>
 			this.openStatusChangeModal()
 		);
+		this.addRibbonIcon("plus-square", "Create item", () =>
+			this.newItemCommand()
+		);
 
 		this.addCommand({
 			id: "new_item",
@@ -121,7 +124,6 @@ export default class MyPlugin extends Plugin {
 		const vault = this.app.vault;
 		const trimmedName = itemName.trim();
 		const folderPath = itemType.folder;
-		const sanitizedName = trimmedName.replace(/[\\/:<>"|?*]/g, "-");
 
 		if (!trimmedName) {
 			new Notice(`${itemType.label} name cannot be empty`);
@@ -142,21 +144,38 @@ export default class MyPlugin extends Plugin {
 			return;
 		}
 
-		const filePath = `${folderPath}/${sanitizedName}.md`;
-		if (vault.getAbstractFileByPath(filePath)) {
-			new Notice(`${itemType.label} '${sanitizedName}' already exists`);
-			return;
-		}
-
+		let displayName = trimmedName;
 		let thumbnail: string | null = null;
 		if (itemType.folder === "games") {
 			const accessToken = await this.ensureIgdbAccessToken();
 			if (accessToken) {
-				thumbnail = await fetchGameThumbnail(trimmedName, {
+				const metadata = await fetchGameMetadata(trimmedName, {
 					clientId: this.settings.igdbClientId,
 					accessToken,
 				});
+				if (metadata) {
+					if (metadata.canonicalName) {
+						const canonical = metadata.canonicalName.trim();
+						if (canonical.length > 0) {
+							displayName = canonical;
+						}
+					}
+					thumbnail = metadata.thumbnail ?? null;
+				}
 			}
+		}
+
+		const sanitizeName = (value: string) =>
+			value.trim().replace(/[\\/:<>"|?*]/g, "-");
+		let sanitizedName = sanitizeName(displayName);
+		if (!sanitizedName) {
+			sanitizedName = sanitizeName(trimmedName);
+		}
+
+		const filePath = `${folderPath}/${sanitizedName}.md`;
+		if (vault.getAbstractFileByPath(filePath)) {
+			new Notice(`${itemType.label} '${displayName}' already exists`);
+			return;
 		}
 
 		const formattedDate = datefns.format(new Date(), this.settings.dateFormat);
@@ -169,9 +188,11 @@ export default class MyPlugin extends Plugin {
 			frontmatter.push(`thumbnail: ${thumbnail}`);
 		}
 		frontmatter.push("---");
-		const bodyLines = thumbnail
-			? ["", `![Cover Image](${thumbnail})`, ""]
-			: ["", ""];
+		const bodyLines = [""];
+		if (thumbnail) {
+			bodyLines.push(`![Cover Image](${thumbnail})`);
+		}
+		bodyLines.push("");
 		const content = [...frontmatter, ...bodyLines].join("\n");
 
 		const createdFile = await vault.create(filePath, content);

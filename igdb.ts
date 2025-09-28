@@ -9,6 +9,7 @@ interface IgdbGame {
 	cover?: {
 		image_id?: string | null;
 	} | null;
+	name?: string | null;
 }
 
 const IGDB_GAMES_ENDPOINT = "https://api.igdb.com/v4/games";
@@ -61,10 +62,15 @@ export async function requestIgdbAccessToken(
 	}
 }
 
-export async function fetchGameThumbnail(
+export interface GameMetadata {
+	thumbnail: string | null;
+	canonicalName: string | null;
+}
+
+export async function fetchGameMetadata(
 	gameName: string,
 	config: IgdbConfig
-): Promise<string | null> {
+): Promise<GameMetadata | null> {
 	const trimmed = gameName.trim();
 	if (!trimmed) {
 		return null;
@@ -78,7 +84,7 @@ export async function fetchGameThumbnail(
 		return null;
 	}
 
-	const body = `search "${searchTerm}"; fields cover.image_id; limit 1;`;
+	const body = `search "${searchTerm}"; fields name,cover.image_id; limit 1;`;
 
 	try {
 		const response = await requestUrl({
@@ -106,14 +112,21 @@ export async function fetchGameThumbnail(
 			return null;
 		}
 
-		const imageId = games[0]?.cover?.image_id;
-		if (!imageId || typeof imageId !== "string") {
-			return null;
-		}
+		const primary = games[0];
+		const imageId = primary?.cover?.image_id;
+		const canonicalName =
+			typeof primary?.name === "string" ? primary.name : null;
+		const thumbnail =
+			imageId && typeof imageId === "string"
+				? `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`
+				: null;
 
-		return `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`;
+		return {
+			thumbnail,
+			canonicalName,
+		};
 	} catch (error) {
-		console.error("Failed to fetch IGDB thumbnail", error);
+		console.error("Failed to fetch IGDB metadata", error);
 		return null;
 	}
 }
