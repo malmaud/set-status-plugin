@@ -1,10 +1,12 @@
 import {
 	App,
 	FuzzySuggestModal,
+	Modal,
 	Notice,
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	TFolder,
 } from "obsidian";
 import * as datefns from "date-fns";
 import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
@@ -49,6 +51,12 @@ export default class MyPlugin extends Plugin {
 			this.openStatusChangeModal()
 		);
 
+		this.addCommand({
+			id: "new_game",
+			name: "New game",
+			callback: () => this.newGameCommand(),
+		});
+
 		this.addSettingTab(new SettingsTab(this.app, this));
 	}
 
@@ -75,6 +83,60 @@ export default class MyPlugin extends Plugin {
 			this.setStatus.bind(this),
 			statusChoices
 		).open();
+	}
+
+	newGameCommand() {
+		const statusOptions = this.settings.statusNames;
+		new GameNameModal(
+			this.app,
+			statusOptions,
+			this.createGameFile.bind(this)
+		).open();
+	}
+
+	async createGameFile(gameName: string, status: string): Promise<void> {
+		const vault = this.app.vault;
+		const folderPath = "games";
+		const sanitizedName = gameName
+			.trim()
+			.replace(/[\\/:<>"|?*]/g, "-");
+
+		if (!sanitizedName) {
+			new Notice("Game name cannot be empty");
+			return;
+		}
+
+		const chosenStatus = status.trim();
+		if (!chosenStatus) {
+			new Notice("Please select a status");
+			return;
+		}
+
+		const folder = vault.getAbstractFileByPath(folderPath);
+		if (!folder) {
+			await vault.createFolder(folderPath);
+		} else if (!(folder instanceof TFolder)) {
+			new Notice("'games' exists but is not a folder");
+			return;
+		}
+
+		const filePath = `${folderPath}/${sanitizedName}.md`;
+		if (vault.getAbstractFileByPath(filePath)) {
+			new Notice(`Game '${sanitizedName}' already exists`);
+			return;
+		}
+
+		const formattedDate = datefns.format(new Date(), this.settings.dateFormat);
+		const content = [
+			"---",
+			`status: ${chosenStatus}`,
+			`status date: ${formattedDate}`,
+			"---",
+			"",
+		].join("\n");
+
+		await vault.create(filePath, content);
+		new Notice(`Created ${filePath}`);
 	}
 
 	async setStatus(status: Status) {
@@ -132,6 +194,87 @@ class ChoiceModal extends FuzzySuggestModal<Status> {
 
 	onChooseItem(status: Status, evt: MouseEvent | KeyboardEvent) {
 		this.onSubmit(status);
+	}
+}
+
+class GameNameModal extends Modal {
+	onSubmit: (gameName: string, status: string) => Promise<void>;
+	private readonly statuses: string[];
+	private gameName = "";
+	private selectedStatus: string;
+
+	constructor(
+		app: App,
+		statuses: string[],
+		onSubmit: (gameName: string, status: string) => Promise<void>
+	) {
+		super(app);
+		this.statuses = statuses;
+		this.onSubmit = onSubmit;
+		this.selectedStatus = statuses[0] ?? "";
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h2", { text: "New game" });
+
+		new Setting(contentEl)
+			.setName("Game name")
+			.addText((text) => {
+				text.setPlaceholder("Enter game name");
+				text.onChange((value) => {
+					this.gameName = value;
+				});
+				text.inputEl.focus();
+				text.inputEl.addEventListener("keydown", (event) => {
+					if (event.key === "Enter") {
+						this.submit();
+					}
+				});
+			});
+
+		new Setting(contentEl)
+			.setName("Status")
+			.addDropdown((dropdown) => {
+				if (this.statuses.length === 0) {
+					dropdown.addOption("", "No statuses configured");
+					dropdown.setDisabled(true);
+					this.selectedStatus = "";
+					return;
+				}
+				this.statuses.forEach((status) => {
+					dropdown.addOption(status, status);
+				});
+				if (this.selectedStatus) {
+					dropdown.setValue(this.selectedStatus);
+				}
+				dropdown.onChange((value) => {
+					this.selectedStatus = value;
+				});
+			});
+
+		new Setting(contentEl)
+			.addButton((button) =>
+				button
+					.setButtonText("Create")
+					.setCta()
+					.onClick(() => this.submit())
+			);
+	}
+
+	private async submit() {
+		const trimmed = this.gameName.trim();
+		if (!trimmed) {
+			new Notice("Game name cannot be empty");
+			return;
+		}
+		await this.onSubmit(trimmed, this.selectedStatus ?? "");
+		this.close();
+	}
+
+	onClose() {
+		this.contentEl.empty();
 	}
 }
 
