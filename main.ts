@@ -11,6 +11,7 @@ import {
 } from "obsidian";
 import * as datefns from "date-fns";
 import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
+import { fetchGameThumbnail, requestIgdbAccessToken } from "./igdb";
 
 interface Status {
 	name: string;
@@ -24,11 +25,15 @@ interface ItemType {
 interface Settings {
 	statusNames: string[];
 	dateFormat: string;
+	igdbClientId: string;
+	igdbClientSecret: string;
 }
 
 const DEFAULT_SETTINGS: Settings = {
 	statusNames: ["complete", "abandoned", "backlog", "on radar", "in progress"],
 	dateFormat: "yyyy-MM-dd",
+	igdbClientId: "",
+	igdbClientSecret: "",
 };
 
 const ITEM_TYPES: ItemType[] = [
@@ -39,6 +44,7 @@ const ITEM_TYPES: ItemType[] = [
 
 export default class MyPlugin extends Plugin {
 	settings: Settings;
+	private igdbToken: { value: string; expiresAt: number } | null = null;
 
 	async onload() {
 		console.log("loaded status updates");
@@ -113,12 +119,11 @@ export default class MyPlugin extends Plugin {
 		itemType: ItemType
 	): Promise<void> {
 		const vault = this.app.vault;
+		const trimmedName = itemName.trim();
 		const folderPath = itemType.folder;
-		const sanitizedName = itemName
-			.trim()
-			.replace(/[\\/:<>"|?*]/g, "-");
+		const sanitizedName = trimmedName.replace(/[\\/:<>"|?*]/g, "-");
 
-		if (!sanitizedName) {
+		if (!trimmedName) {
 			new Notice(`${itemType.label} name cannot be empty`);
 			return;
 		}
@@ -143,19 +148,68 @@ export default class MyPlugin extends Plugin {
 			return;
 		}
 
+		let thumbnail: string | null = null;
+		if (itemType.folder === "games") {
+			const accessToken = await this.ensureIgdbAccessToken();
+			if (accessToken) {
+				thumbnail = await fetchGameThumbnail(trimmedName, {
+					clientId: this.settings.igdbClientId,
+					accessToken,
+				});
+			}
+		}
+
 		const formattedDate = datefns.format(new Date(), this.settings.dateFormat);
-		const content = [
+		const frontmatter = [
 			"---",
 			`status: ${chosenStatus}`,
 			`status date: ${formattedDate}`,
-			"---",
-			"",
-		].join("\n");
+		];
+		if (thumbnail) {
+			frontmatter.push(`thumbnail: ${thumbnail}`);
+		}
+		frontmatter.push("---");
+		const bodyLines = thumbnail
+			? ["", `![Cover Image](${thumbnail})`, ""]
+			: ["", ""];
+		const content = [...frontmatter, ...bodyLines].join("\n");
 
 		const createdFile = await vault.create(filePath, content);
-		const leaf = this.app.workspace.getLeaf(false) ?? this.app.workspace.getLeaf(true);
-		await leaf.openFile(createdFile);
+		const leaf =
+			this.app.workspace.getLeaf(false) ?? this.app.workspace.getLeaf(true);
+		if (leaf) {
+			await leaf.openFile(createdFile);
+		}
 		new Notice(`Created ${filePath}`);
+	}
+
+	private async ensureIgdbAccessToken(): Promise<string | null> {
+		const { igdbClientId, igdbClientSecret } = this.settings;
+		if (!igdbClientId || !igdbClientSecret) {
+			return null;
+		}
+		const now = Date.now();
+		if (this.igdbToken && this.igdbToken.expiresAt > now + 60_000) {
+			return this.igdbToken.value;
+		}
+		const token = await requestIgdbAccessToken(
+			igdbClientId,
+			igdbClientSecret
+		);
+		if (!token) {
+			new Notice("Could not reach IGDB – check your client credentials.");
+			return null;
+		}
+		const expiresAt = now + Math.max(0, token.expiresIn - 60) * 1000;
+		this.igdbToken = {
+			value: token.accessToken,
+			expiresAt,
+		};
+		return this.igdbToken.value;
+	}
+
+	clearIgdbTokenCache(): void {
+		this.igdbToken = null;
 	}
 
 	async setStatus(status: Status) {
@@ -425,6 +479,26 @@ class SettingsTab extends PluginSettingTab {
 		await this.plugin.saveSettings();
 	}
 
+	getIgdbClientId(): string {
+		return this.plugin.settings.igdbClientId;
+	}
+
+	async setIgdbClientId(value: string): Promise<void> {
+		this.plugin.settings.igdbClientId = value.trim();
+		await this.plugin.saveSettings();
+		this.plugin.clearIgdbTokenCache();
+	}
+
+	getIgdbClientSecret(): string {
+		return this.plugin.settings.igdbClientSecret;
+	}
+
+	async setIgdbClientSecret(value: string): Promise<void> {
+		this.plugin.settings.igdbClientSecret = value.trim();
+		await this.plugin.saveSettings();
+		this.plugin.clearIgdbTokenCache();
+	}
+
 	display(): void {
 		const containerEl = this.containerEl;
 		containerEl.empty();
@@ -446,5 +520,29 @@ class SettingsTab extends PluginSettingTab {
 				.setValue(this.getDateFormat())
 				.onChange(async (value) => await this.setDateFormat(value));
 		});
+		new Setting(containerEl)
+			.setHeading()
+			.setName("IGDB API");
+		new Setting(containerEl)
+			.setName("Client ID")
+			.setDesc("Required to look up covers via the IGDB API.")
+			.addText((text) => {
+				text.setPlaceholder("Enter IGDB client ID")
+					.setValue(this.getIgdbClientId())
+					.onChange(async (value) => {
+						await this.setIgdbClientId(value);
+					});
+			});
+		new Setting(containerEl)
+			.setName("Client secret")
+			.setDesc("Stored securely in your vault and used to request short-lived IGDB tokens as needed.")
+			.addText((text) => {
+				text.setPlaceholder("Enter IGDB client secret")
+					.setValue(this.getIgdbClientSecret())
+					.onChange(async (value) => {
+						await this.setIgdbClientSecret(value);
+					});
+				text.inputEl.type = "password";
+			});
 	}
 }
