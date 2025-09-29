@@ -10,12 +10,16 @@ interface IgdbGame {
 		image_id?: string | null;
 	} | null;
 	name?: string | null;
+	total_rating_count?: number | null;
+	rating_count?: number | null;
 }
 
 const IGDB_GAMES_ENDPOINT = "https://api.igdb.com/v4/games";
 const IGDB_IMAGE_BASE_URL = "https://images.igdb.com/igdb/image/upload/";
 const IGDB_COVER_SIZE = "t_cover_big";
 const IGDB_TOKEN_ENDPOINT = "https://id.twitch.tv/oauth2/token";
+const IGDB_MAX_RETRIES = 3;
+const IGDB_BASE_BACKOFF_MS = 1000;
 
 export interface IgdbAccessToken {
 	accessToken: string;
@@ -84,51 +88,75 @@ export async function fetchGameMetadata(
 		return null;
 	}
 
-	const body = `search "${searchTerm}"; fields name,cover.image_id; limit 1;`;
+	const body =
+		`search "${searchTerm}"; fields name,cover.image_id,total_rating_count,rating_count; limit 5;`;
 
-	try {
-		const response = await requestUrl({
-			url: IGDB_GAMES_ENDPOINT,
-			method: "POST",
-			headers: {
-				"Client-ID": config.clientId,
-				Authorization: `Bearer ${config.accessToken}`,
-				Accept: "application/json",
-				"Content-Type": "text/plain",
-			},
-			body,
-			throw: false,
-		});
+	for (let attempt = 1; attempt <= IGDB_MAX_RETRIES; attempt++) {
+		try {
+			const response = await requestUrl({
+				url: IGDB_GAMES_ENDPOINT,
+				method: "POST",
+				headers: {
+					"Client-ID": config.clientId,
+					Authorization: `Bearer ${config.accessToken}`,
+					Accept: "application/json",
+					"Content-Type": "text/plain",
+				},
+				body,
+				throw: false,
+			});
 
-		if (response.status >= 400) {
-			console.error(
-				`IGDB request failed (${response.status}): ${response.text ?? ""}`
-			);
+			if (response.status >= 400) {
+				const tooManyRequests = isTooManyRequests(
+					response.status,
+					response.text
+				);
+				if (tooManyRequests && attempt < IGDB_MAX_RETRIES) {
+					const delayMs = IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
+					console.warn(
+						`IGDB rate limited (attempt ${attempt}/${IGDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
+					);
+					await delay(delayMs);
+					continue;
+				}
+				console.error(
+					`IGDB request failed (${response.status}): ${response.text ?? ""}`
+				);
+				return null;
+			}
+
+			const games = normalizeResponse(response.json, response.text);
+			const ranked = rankGamesByPlayedCount(games);
+			if (!ranked) {
+				return null;
+			}
+
+			const imageId = ranked.cover?.image_id;
+			const canonicalName = typeof ranked.name === "string" ? ranked.name : null;
+			const thumbnail =
+				imageId && typeof imageId === "string"
+					? `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`
+					: null;
+
+			return {
+				thumbnail,
+				canonicalName,
+			};
+		} catch (error) {
+			const tooManyRequests = isTooManyRequests(undefined, undefined, error);
+			if (tooManyRequests && attempt < IGDB_MAX_RETRIES) {
+				const delayMs = IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
+				console.warn(
+					`IGDB rate limited (attempt ${attempt}/${IGDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
+				);
+				await delay(delayMs);
+				continue;
+			}
+			console.error("Failed to fetch IGDB metadata", error);
 			return null;
 		}
-
-		const games = normalizeResponse(response.json, response.text);
-		if (games.length === 0) {
-			return null;
-		}
-
-		const primary = games[0];
-		const imageId = primary?.cover?.image_id;
-		const canonicalName =
-			typeof primary?.name === "string" ? primary.name : null;
-		const thumbnail =
-			imageId && typeof imageId === "string"
-				? `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`
-				: null;
-
-		return {
-			thumbnail,
-			canonicalName,
-		};
-	} catch (error) {
-		console.error("Failed to fetch IGDB metadata", error);
-		return null;
 	}
+	return null;
 }
 
 function sanitizeQuery(value: string): string {
@@ -153,6 +181,32 @@ function normalizeResponse(
 		}
 	}
 	return [];
+}
+
+function rankGamesByPlayedCount(games: IgdbGame[]): IgdbGame | null {
+	if (games.length === 0) {
+		return null;
+	}
+	const withCount = games.map((game, index) => {
+		const total = normalizeCountValue(game.total_rating_count);
+		const rating = normalizeCountValue(game.rating_count);
+		const playedCount = Math.max(total, rating, 0);
+		return { game, playedCount, index };
+	});
+	withCount.sort((a, b) => {
+		if (b.playedCount !== a.playedCount) {
+			return b.playedCount - a.playedCount;
+		}
+		return a.index - b.index;
+	});
+	return withCount[0]?.game ?? null;
+}
+
+function normalizeCountValue(value: number | null | undefined): number {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value;
+	}
+	return 0;
 }
 
 function normalizeTokenResponse(
@@ -207,4 +261,32 @@ function normalizeExpiresIn(value: unknown): number | null {
 		}
 	}
 	return null;
+}
+
+function isTooManyRequests(
+	status: number | undefined,
+	text: string | undefined,
+	error?: unknown
+): boolean {
+	if (status === 429) {
+		return true;
+	}
+	const messageSources: string[] = [];
+	if (typeof text === "string" && text.length > 0) {
+		messageSources.push(text);
+	}
+	const errorMessage =
+		error && typeof (error as { message?: unknown }).message === "string"
+			? (error as { message: string }).message
+			: undefined;
+	if (errorMessage) {
+		messageSources.push(errorMessage);
+	}
+	return messageSources.some((value) =>
+		value.toLowerCase().includes("too many requests")
+	);
+}
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }

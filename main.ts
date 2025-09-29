@@ -6,11 +6,12 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	TFile,
 	TFolder,
 	TextComponent,
 } from "obsidian";
 import * as datefns from "date-fns";
-import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
+import { extractFrontmatter, convertToMarkdown, DocumentData } from "./frontmatter";
 import { fetchGameMetadata, requestIgdbAccessToken } from "./igdb";
 
 interface Status {
@@ -29,6 +30,13 @@ interface Settings {
 	igdbClientSecret: string;
 }
 
+type ThumbnailUpdateStatus = "updated" | "unchanged" | "skipped";
+
+interface ThumbnailUpdateResult {
+	status: ThumbnailUpdateStatus;
+	reason?: string;
+}
+
 const DEFAULT_SETTINGS: Settings = {
 	statusNames: ["complete", "abandoned", "backlog", "on radar", "in progress"],
 	dateFormat: "yyyy-MM-dd",
@@ -41,6 +49,10 @@ const ITEM_TYPES: ItemType[] = [
 	{ label: "TV Show", folder: "tv shows" },
 	{ label: "Book", folder: "books" },
 ];
+
+const GAMES_FOLDER = ITEM_TYPES.find(
+	(item) => item.label.toLowerCase() === "game"
+)	?.folder ?? "games";
 
 export default class MyPlugin extends Plugin {
 	settings: Settings;
@@ -76,6 +88,18 @@ export default class MyPlugin extends Plugin {
 			id: "new_item",
 			name: "New item",
 			callback: () => this.newItemCommand(),
+		});
+
+		this.addCommand({
+			id: "refresh-game-thumbnails",
+			name: "Refresh game thumbnails",
+			callback: () => this.refreshGameThumbnailsCommand(),
+		});
+
+		this.addCommand({
+			id: "refresh-current-game-thumbnail",
+			name: "Refresh current game thumbnail",
+			callback: () => this.refreshCurrentGameThumbnailCommand(),
 		});
 
 		this.addSettingTab(new SettingsTab(this.app, this));
@@ -202,6 +226,228 @@ export default class MyPlugin extends Plugin {
 			await leaf.openFile(createdFile);
 		}
 		new Notice(`Created ${filePath}`);
+	}
+
+	async refreshGameThumbnailsCommand(): Promise<void> {
+		if (!this.settings.igdbClientId || !this.settings.igdbClientSecret) {
+			new Notice(
+				"Set your IGDB client credentials in the plugin settings before refreshing thumbnails."
+			);
+			return;
+		}
+
+		const folder = this.app.vault.getAbstractFileByPath(GAMES_FOLDER);
+		if (!folder) {
+			new Notice(`Folder '${GAMES_FOLDER}' does not exist.`);
+			return;
+		}
+		if (!(folder instanceof TFolder)) {
+			new Notice(`'${GAMES_FOLDER}' exists but is not a folder.`);
+			return;
+		}
+
+		const files = this.collectMarkdownFiles(folder);
+		if (files.length === 0) {
+			new Notice(`No game notes found in '${GAMES_FOLDER}'.`);
+			return;
+		}
+
+		const accessToken = await this.ensureIgdbAccessToken();
+		if (!accessToken) {
+			return;
+		}
+
+		let updated = 0;
+		let unchanged = 0;
+		let skipped = 0;
+
+		for (const file of files) {
+			try {
+				const result = await this.updateGameNoteThumbnail(file, accessToken);
+				switch (result.status) {
+					case "updated":
+						updated++;
+						break;
+					case "unchanged":
+						unchanged++;
+						break;
+					case "skipped":
+					default:
+						skipped++;
+						if (result.reason) {
+							console.warn(
+								`[Set Status Plugin] Thumbnail refresh skipped for '${file.path}': ${result.reason}`
+							);
+						}
+						break;
+				}
+				if (result.status === "unchanged" && result.reason) {
+					console.info(
+						`[Set Status Plugin] Thumbnail already current for '${file.path}': ${result.reason}`
+					);
+				}
+			} catch (error) {
+				console.error(`Failed to update thumbnail for ${file.path}`, error);
+				skipped++;
+			}
+		}
+
+		const summaryParts = [`${updated} updated`];
+		if (unchanged > 0) {
+			summaryParts.push(`${unchanged} already current`);
+		}
+		if (skipped > 0) {
+			summaryParts.push(`${skipped} skipped`);
+		}
+
+		new Notice(`Game thumbnails: ${summaryParts.join(", ")}`);
+	}
+
+	async refreshCurrentGameThumbnailCommand(): Promise<void> {
+		if (!this.settings.igdbClientId || !this.settings.igdbClientSecret) {
+			new Notice(
+				"Set your IGDB client credentials in the plugin settings before refreshing thumbnails."
+			);
+			return;
+		}
+
+		const file = this.app.workspace.getActiveFile();
+		if (!file || !(file instanceof TFile) || file.extension !== "md") {
+			new Notice("Open a markdown game note before refreshing its thumbnail.");
+			return;
+		}
+
+		const normalizedPath = file.path.replace(/\\/g, "/");
+		const folderPrefix = `${GAMES_FOLDER.toLowerCase()}/`;
+		if (!normalizedPath.toLowerCase().startsWith(folderPrefix)) {
+			new Notice(`Active file is not inside '${GAMES_FOLDER}'.`);
+			return;
+		}
+
+		const accessToken = await this.ensureIgdbAccessToken();
+		if (!accessToken) {
+			return;
+		}
+
+		const result = await this.updateGameNoteThumbnail(file, accessToken);
+		switch (result.status) {
+			case "updated":
+				new Notice("Thumbnail updated from IGDB.");
+				break;
+			case "unchanged":
+				new Notice("Thumbnail already matches the latest IGDB cover.");
+				if (result.reason) {
+					console.info(
+						`[Set Status Plugin] Thumbnail already current for '${file.path}': ${result.reason}`
+					);
+				}
+				break;
+			default:
+				new Notice("Could not update the thumbnail for this note.");
+				if (result.reason) {
+					console.warn(
+						`[Set Status Plugin] Thumbnail refresh skipped for '${file.path}': ${result.reason}`
+					);
+				}
+				break;
+		}
+	}
+
+	private collectMarkdownFiles(folder: TFolder): TFile[] {
+		const files: TFile[] = [];
+		const stack: TFolder[] = [folder];
+		while (stack.length > 0) {
+			const current = stack.pop();
+			if (!current) {
+				continue;
+			}
+			for (const child of current.children) {
+				if (child instanceof TFolder) {
+					stack.push(child);
+				} else if (child instanceof TFile && child.extension === "md") {
+					files.push(child);
+				}
+			}
+		}
+		return files;
+	}
+
+	private resolveGameName(file: TFile): string {
+		return file.basename.trim();
+	}
+
+	private upsertCoverImage(
+		content: string,
+		thumbnail: string
+	): { text: string; changed: boolean } {
+		const coverLine = `![Cover Image](${thumbnail})`;
+		const normalizedOriginal = content.replace(/\r\n/g, "\n");
+		const imageRegex = /!\[[^\]]*]\([^\)]+\)/g;
+		const withoutImages = normalizedOriginal.replace(imageRegex, "");
+		const trimmedLeading = withoutImages.replace(/^\n+/, "");
+		const trimmedTrailing = trimmedLeading.replace(/\s+$/, "");
+		let finalContent = coverLine;
+		if (trimmedTrailing.length > 0) {
+			finalContent += `\n\n${trimmedTrailing}`;
+		}
+		finalContent = finalContent.replace(/\n{3,}/g, "\n\n");
+		if (!finalContent.endsWith("\n")) {
+			finalContent += "\n";
+		}
+		const changed = finalContent !== normalizedOriginal;
+		return { text: finalContent, changed };
+	}
+
+	private async updateGameNoteThumbnail(
+		file: TFile,
+		accessToken: string
+	): Promise<ThumbnailUpdateResult> {
+		const vault = this.app.vault;
+		const raw = await vault.read(file);
+		const data = extractFrontmatter(raw);
+		const gameName = this.resolveGameName(file).trim();
+		if (!gameName) {
+			return {
+				status: "skipped",
+				reason: "Could not determine a game name from frontmatter, heading, or filename.",
+			};
+		}
+		const metadata = await fetchGameMetadata(gameName, {
+			clientId: this.settings.igdbClientId,
+			accessToken,
+		});
+		if (!metadata) {
+			return {
+				status: "skipped",
+				reason: `No IGDB result found for '${gameName}'.`,
+			};
+		}
+		if (!metadata.thumbnail) {
+			return {
+				status: "skipped",
+				reason: `IGDB result for '${gameName}' lacks a cover image.`,
+			};
+		}
+
+		const nextThumbnail = metadata.thumbnail;
+		const currentThumbnail =
+			typeof data.frontmatter?.["thumbnail"] === "string"
+				? data.frontmatter["thumbnail"].trim()
+				: null;
+		const { text: updatedContent, changed: contentChanged } =
+			this.upsertCoverImage(data.content, nextThumbnail);
+		const frontmatterChanged = currentThumbnail !== nextThumbnail;
+		if (!frontmatterChanged && !contentChanged) {
+			return {
+				status: "unchanged",
+				reason: "Note already references the current IGDB thumbnail.",
+			};
+		}
+		data.frontmatter["thumbnail"] = nextThumbnail;
+		data.content = updatedContent;
+		const markdown = convertToMarkdown(data);
+		await vault.modify(file, markdown);
+		return { status: "updated" };
 	}
 
 	private async ensureIgdbAccessToken(): Promise<string | null> {
