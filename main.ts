@@ -54,6 +54,8 @@ const GAMES_FOLDER = ITEM_TYPES.find(
 	(item) => item.label.toLowerCase() === "game"
 )	?.folder ?? "games";
 
+const GAME_STATUSES_WITHOUT_DATE = new Set(["complete", "abandoned"]);
+
 export default class MyPlugin extends Plugin {
 	settings: Settings;
 	private igdbToken: { value: string; expiresAt: number } | null = null;
@@ -202,12 +204,17 @@ export default class MyPlugin extends Plugin {
 			return;
 		}
 
-		const formattedDate = datefns.format(new Date(), this.settings.dateFormat);
-		const frontmatter = [
-			"---",
-			`status: ${chosenStatus}`,
-			`status date: ${formattedDate}`,
-		];
+		const frontmatter = ["---", `status: ${chosenStatus}`];
+		const isGame = itemType.folder === GAMES_FOLDER;
+		const shouldOmitStatusDate =
+			isGame && GAME_STATUSES_WITHOUT_DATE.has(chosenStatus.toLowerCase());
+		if (!shouldOmitStatusDate) {
+			const formattedDate = datefns.format(
+				new Date(),
+				this.settings.dateFormat
+			);
+			frontmatter.push(`status date: ${formattedDate}`);
+		}
 		if (thumbnail) {
 			frontmatter.push(`thumbnail: ${thumbnail}`);
 		}
