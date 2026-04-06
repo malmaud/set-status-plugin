@@ -5,7 +5,7 @@ const { mockRequestUrl } = vi.hoisted(() => ({
 }));
 vi.mock("obsidian", () => ({ requestUrl: mockRequestUrl }));
 
-import { fetchTvShowMetadata, stripSeasonSuffix } from "./tmdb";
+import { fetchTvShowMetadata, searchTvShows, stripSeasonSuffix } from "./tmdb";
 
 beforeEach(() => {
 	mockRequestUrl.mockReset();
@@ -196,6 +196,38 @@ describe("fetchTvShowMetadata", () => {
 		const calledUrl = mockRequestUrl.mock.calls[0][0].url;
 		expect(calledUrl).toContain("query=Severance");
 		expect(calledUrl).not.toContain("s1");
+	});
+});
+
+describe("searchTvShows", () => {
+	const API_KEY = "test-api-key";
+
+	it("returns empty array for empty input", async () => {
+		expect(await searchTvShows("", API_KEY)).toEqual([]);
+	});
+
+	it("returns multiple ranked results", async () => {
+		mockRequestUrl.mockResolvedValue({
+			status: 200,
+			json: {
+				results: [
+					{ name: "Show A", poster_path: "/a.jpg", popularity: 1, vote_count: 2 },
+					{ name: "Show B", poster_path: "/b.jpg", popularity: 500, vote_count: 1000 },
+					{ name: "Show C", poster_path: "/c.jpg", popularity: 50, vote_count: 100 },
+				],
+			},
+		});
+
+		const results = await searchTvShows("show", API_KEY);
+		expect(results).toHaveLength(3);
+		expect(results[0].canonicalName).toBe("Show B");
+		expect(results[1].canonicalName).toBe("Show C");
+		expect(results[2].canonicalName).toBe("Show A");
+	});
+
+	it("returns empty array on error", async () => {
+		mockRequestUrl.mockResolvedValue({ status: 500, text: "Error" });
+		expect(await searchTvShows("show", API_KEY)).toEqual([]);
 	});
 });
 

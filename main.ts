@@ -12,9 +12,9 @@ import {
 } from "obsidian";
 import * as datefns from "date-fns";
 import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
-import { fetchGameMetadata, requestIgdbAccessToken } from "./igdb";
-import { fetchBookMetadata } from "./openlibrary";
-import { fetchTvShowMetadata } from "./tmdb";
+import { fetchGameMetadata, searchGames, requestIgdbAccessToken } from "./igdb";
+import { fetchBookMetadata, searchBooks } from "./openlibrary";
+import { fetchTvShowMetadata, searchTvShows } from "./tmdb";
 
 interface Status {
 	name: string;
@@ -31,6 +31,7 @@ interface Settings {
 	igdbClientId: string;
 	igdbClientSecret: string;
 	tmdbApiKey: string;
+	bookLanguage: string;
 }
 
 type ThumbnailUpdateStatus = "updated" | "unchanged" | "skipped";
@@ -46,6 +47,7 @@ const DEFAULT_SETTINGS: Settings = {
 	igdbClientId: "",
 	igdbClientSecret: "",
 	tmdbApiKey: "",
+	bookLanguage: "eng",
 };
 
 const ITEM_TYPES: ItemType[] = [
@@ -117,6 +119,21 @@ export default class MyPlugin extends Plugin {
 				if (!folder) return false;
 				if (!checking) {
 					this.refreshCurrentThumbnailCommand();
+				}
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "pick-thumbnail",
+			name: "Pick thumbnail",
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "md") return false;
+				const folder = this.detectItemFolder(file);
+				if (!folder) return false;
+				if (!checking) {
+					this.pickThumbnailCommand();
 				}
 				return true;
 			},
@@ -281,6 +298,109 @@ export default class MyPlugin extends Plugin {
 		return null;
 	}
 
+	private async searchForFolder(
+		itemName: string,
+		folder: string
+	): Promise<{ thumbnail: string | null; canonicalName: string | null }[]> {
+		console.info(`[Set Status Plugin] searchForFolder: "${itemName}" in "${folder}"`);
+		if (folder === GAMES_FOLDER) {
+			const accessToken = await this.ensureIgdbAccessToken();
+			if (!accessToken) {
+				console.warn("[Set Status Plugin] searchForFolder: no IGDB access token");
+				return [];
+			}
+			return searchGames(itemName, {
+				clientId: this.settings.igdbClientId,
+				accessToken,
+			});
+		}
+		if (folder === BOOKS_FOLDER) {
+			const lang = this.settings.bookLanguage || undefined;
+			console.info(`[Set Status Plugin] searchForFolder: using book language="${lang ?? "any"}"`);
+			return searchBooks(itemName, lang);
+		}
+		if (folder === TV_SHOWS_FOLDER) {
+			if (!this.settings.tmdbApiKey) {
+				console.warn("[Set Status Plugin] searchForFolder: no TMDB API key");
+				return [];
+			}
+			return searchTvShows(itemName, this.settings.tmdbApiKey);
+		}
+		console.warn(`[Set Status Plugin] searchForFolder: unknown folder "${folder}"`);
+		return [];
+	}
+
+	private applyThumbnail(
+		file: TFile,
+		choice: { thumbnail: string | null; canonicalName: string | null }
+	): void {
+		if (!choice.thumbnail) {
+			new Notice("Selected result has no cover image.");
+			return;
+		}
+		const vault = this.app.vault;
+		vault.read(file).then((raw) => {
+			const data = extractFrontmatter(raw);
+			data.frontmatter["thumbnail"] = choice.thumbnail;
+			const { text: updatedContent } = this.upsertCoverImage(
+				data.content,
+				choice.thumbnail!
+			);
+			data.content = updatedContent;
+			const markdown = convertToMarkdown(data);
+			vault.modify(file, markdown).then(() => {
+				new Notice("Thumbnail updated.");
+			});
+		});
+	}
+
+	async pickThumbnailCommand(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		if (!file || !(file instanceof TFile) || file.extension !== "md") {
+			new Notice("Open a markdown note first.");
+			return;
+		}
+
+		const folder = this.detectItemFolder(file);
+		if (!folder) {
+			new Notice("Active file is not inside a known media folder.");
+			return;
+		}
+
+		const itemName = file.basename.trim();
+		if (!itemName) {
+			new Notice("Could not determine item name from filename.");
+			return;
+		}
+
+		console.info(`[Set Status Plugin] pickThumbnail: "${itemName}" in "${folder}"`);
+		new Notice("Searching...");
+		try {
+			const results = await this.searchForFolder(itemName, folder);
+			console.info(`[Set Status Plugin] pickThumbnail: got ${results.length} results`);
+			if (results.length === 0) {
+				new Notice(`No results found for "${itemName}".`);
+				return;
+			}
+
+			const withCovers = results.filter((r) => r.thumbnail);
+			console.info(`[Set Status Plugin] pickThumbnail: ${withCovers.length} results have covers`);
+			if (withCovers.length === 0) {
+				new Notice("Results found but none have cover images.");
+				return;
+			}
+
+			new ThumbnailPickerModal(
+				this.app,
+				withCovers,
+				(choice) => this.applyThumbnail(file, choice)
+			).open();
+		} catch (error) {
+			console.error("[Set Status Plugin] pickThumbnail failed:", error);
+			new Notice("Failed to search for thumbnails. Check the console for details.");
+		}
+	}
+
 	async refreshCurrentThumbnailCommand(): Promise<void> {
 		const file = this.app.workspace.getActiveFile();
 		if (!file || !(file instanceof TFile) || file.extension !== "md") {
@@ -365,7 +485,7 @@ export default class MyPlugin extends Plugin {
 			});
 		}
 		if (folder === BOOKS_FOLDER) {
-			return fetchBookMetadata(itemName);
+			return fetchBookMetadata(itemName, this.settings.bookLanguage || undefined);
 		}
 		if (folder === TV_SHOWS_FOLDER) {
 			if (!this.settings.tmdbApiKey) return null;
@@ -711,6 +831,79 @@ class ItemModal extends Modal {
 	}
 }
 
+interface ThumbnailChoice {
+	thumbnail: string | null;
+	canonicalName: string | null;
+}
+
+class ThumbnailPickerModal extends Modal {
+	private results: ThumbnailChoice[];
+	private onPick: (choice: ThumbnailChoice) => void;
+
+	constructor(
+		app: App,
+		results: ThumbnailChoice[],
+		onPick: (choice: ThumbnailChoice) => void
+	) {
+		super(app);
+		this.results = results;
+		this.onPick = onPick;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h2", { text: "Pick a thumbnail" });
+
+		const grid = contentEl.createDiv({ cls: "thumbnail-picker-grid" });
+		grid.style.display = "grid";
+		grid.style.gridTemplateColumns = "repeat(auto-fill, minmax(140px, 1fr))";
+		grid.style.gap = "12px";
+		grid.style.marginTop = "12px";
+
+		for (const result of this.results) {
+			const card = grid.createDiv({ cls: "thumbnail-picker-card" });
+			card.style.cursor = "pointer";
+			card.style.textAlign = "center";
+			card.style.padding = "8px";
+			card.style.borderRadius = "6px";
+			card.style.border = "1px solid var(--background-modifier-border)";
+
+			if (result.thumbnail) {
+				const img = card.createEl("img", { attr: { src: result.thumbnail } });
+				img.style.width = "100%";
+				img.style.height = "auto";
+				img.style.borderRadius = "4px";
+				img.style.marginBottom = "6px";
+			}
+
+			if (result.canonicalName) {
+				const label = card.createEl("div", { text: result.canonicalName });
+				label.style.fontSize = "0.85em";
+				label.style.color = "var(--text-muted)";
+				label.style.overflow = "hidden";
+				label.style.textOverflow = "ellipsis";
+				label.style.whiteSpace = "nowrap";
+			}
+
+			card.addEventListener("mouseenter", () => {
+				card.style.border = "1px solid var(--interactive-accent)";
+			});
+			card.addEventListener("mouseleave", () => {
+				card.style.border = "1px solid var(--background-modifier-border)";
+			});
+			card.addEventListener("click", () => {
+				this.onPick(result);
+				this.close();
+			});
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class StatusSuggestModal extends FuzzySuggestModal<string> {
 	constructor(
 		app: App,
@@ -973,5 +1166,17 @@ class SettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setDesc("Open Library requires no API key. Book cover lookups are always available.");
+
+		new Setting(containerEl)
+			.setName("Language")
+			.setDesc("3-letter ISO 639-2 code (e.g. eng, fra, deu, spa, jpn). Leave empty for all languages.")
+			.addText((text) => {
+				text.setPlaceholder("eng")
+					.setValue(this.plugin.settings.bookLanguage)
+					.onChange(async (value) => {
+						this.plugin.settings.bookLanguage = value.trim().toLowerCase();
+						await this.plugin.saveSettings();
+					});
+			});
 	}
 }

@@ -7,6 +7,7 @@ vi.mock("obsidian", () => ({ requestUrl: mockRequestUrl }));
 
 import {
 	fetchGameMetadata,
+	searchGames,
 	requestIgdbAccessToken,
 	type IgdbConfig,
 } from "./igdb";
@@ -165,6 +166,35 @@ describe("fetchGameMetadata", () => {
 		const headers = mockRequestUrl.mock.calls[0][0].headers;
 		expect(headers["Client-ID"]).toBe("test-client-id");
 		expect(headers["Authorization"]).toBe("Bearer test-token");
+	});
+});
+
+describe("searchGames", () => {
+	it("returns empty array for empty input", async () => {
+		expect(await searchGames("", CONFIG)).toEqual([]);
+	});
+
+	it("returns multiple ranked results", async () => {
+		mockRequestUrl.mockResolvedValue({
+			status: 200,
+			json: [
+				{ name: "Game A", cover: { image_id: "a1" }, total_rating_count: 10 },
+				{ name: "Game B", cover: { image_id: "b1" }, total_rating_count: 500 },
+				{ name: "Game C", cover: { image_id: "c1" }, total_rating_count: 100 },
+			],
+		});
+
+		const results = await searchGames("game", CONFIG);
+		expect(results).toHaveLength(3);
+		expect(results[0].canonicalName).toBe("Game B");
+		expect(results[1].canonicalName).toBe("Game C");
+		expect(results[2].canonicalName).toBe("Game A");
+		expect(results[0].thumbnail).toContain("b1");
+	});
+
+	it("returns empty array on error", async () => {
+		mockRequestUrl.mockResolvedValue({ status: 500, text: "Error" });
+		expect(await searchGames("game", CONFIG)).toEqual([]);
 	});
 });
 

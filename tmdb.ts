@@ -1,5 +1,6 @@
 import { requestUrl } from "obsidian";
 
+const LOG_PREFIX = "[Set Status Plugin] [TMDB]";
 const TMDB_SEARCH_ENDPOINT = "https://api.themoviedb.org/3/search/tv";
 const TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/";
 const TMDB_POSTER_SIZE = "w500";
@@ -18,16 +19,76 @@ interface TmdbTvResult {
 	vote_count?: number | null;
 }
 
+export async function searchTvShows(
+	showName: string,
+	apiKey: string
+): Promise<TvShowMetadata[]> {
+	const trimmed = showName.trim();
+	if (!trimmed || !apiKey) {
+		console.info(`${LOG_PREFIX} searchTvShows: skipped (empty input or missing key)`);
+		return [];
+	}
+
+	const query = stripSeasonSuffix(trimmed);
+	console.info(`${LOG_PREFIX} searchTvShows: query="${query}" (original="${trimmed}")`);
+
+	const params = new URLSearchParams({
+		api_key: apiKey,
+		query,
+	});
+
+	const url = `${TMDB_SEARCH_ENDPOINT}?${params.toString()}`;
+
+	for (let attempt = 1; attempt <= TMDB_MAX_RETRIES; attempt++) {
+		try {
+			const response = await requestUrl({
+				url,
+				method: "GET",
+				headers: { Accept: "application/json" },
+				throw: false,
+			});
+
+			console.info(`${LOG_PREFIX} searchTvShows: status=${response.status} (attempt ${attempt})`);
+
+			if (response.status >= 400) {
+				if (response.status === 429 && attempt < TMDB_MAX_RETRIES) {
+					await delay(TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
+					continue;
+				}
+				return [];
+			}
+
+			const data = response.json;
+			const results: TmdbTvResult[] = Array.isArray(data?.results)
+				? data.results
+				: [];
+			const mapped = rankAllTvShows(results).map(showToMetadata);
+			console.info(`${LOG_PREFIX} searchTvShows: returning ${mapped.length} results`);
+			return mapped;
+		} catch (error) {
+			console.error(`${LOG_PREFIX} searchTvShows: error (attempt ${attempt}):`, error);
+			if (attempt < TMDB_MAX_RETRIES) {
+				await delay(TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
+				continue;
+			}
+			return [];
+		}
+	}
+	return [];
+}
+
 export async function fetchTvShowMetadata(
 	showName: string,
 	apiKey: string
 ): Promise<TvShowMetadata | null> {
 	const trimmed = showName.trim();
 	if (!trimmed || !apiKey) {
+		console.info(`${LOG_PREFIX} fetchTvShowMetadata: skipped (empty input or missing key)`);
 		return null;
 	}
 
 	const query = stripSeasonSuffix(trimmed);
+	console.info(`${LOG_PREFIX} fetchTvShowMetadata: query="${query}" (original="${trimmed}")`);
 
 	const params = new URLSearchParams({
 		api_key: apiKey,
@@ -64,19 +125,12 @@ export async function fetchTvShowMetadata(
 			const results: TmdbTvResult[] = Array.isArray(data?.results)
 				? data.results
 				: [];
-			const best = rankTvShows(results);
-			if (!best) {
+			const ranked = rankAllTvShows(results);
+			if (ranked.length === 0) {
 				return null;
 			}
 
-			const thumbnail =
-				typeof best.poster_path === "string" && best.poster_path.length > 0
-					? `${TMDB_IMAGE_BASE_URL}${TMDB_POSTER_SIZE}${best.poster_path}`
-					: null;
-			const canonicalName =
-				typeof best.name === "string" ? best.name : null;
-
-			return { thumbnail, canonicalName };
+			return showToMetadata(ranked[0]);
 		} catch (error) {
 			if (attempt < TMDB_MAX_RETRIES) {
 				const delayMs = TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
@@ -93,9 +147,9 @@ export async function fetchTvShowMetadata(
 	return null;
 }
 
-function rankTvShows(results: TmdbTvResult[]): TmdbTvResult | null {
+function rankAllTvShows(results: TmdbTvResult[]): TmdbTvResult[] {
 	if (results.length === 0) {
-		return null;
+		return [];
 	}
 	const scored = results.map((show, index) => {
 		const popularity = safeNum(show.popularity);
@@ -107,7 +161,16 @@ function rankTvShows(results: TmdbTvResult[]): TmdbTvResult | null {
 		if (b.score !== a.score) return b.score - a.score;
 		return a.index - b.index;
 	});
-	return scored[0]?.show ?? null;
+	return scored.map((entry) => entry.show);
+}
+
+function showToMetadata(show: TmdbTvResult): TvShowMetadata {
+	const thumbnail =
+		typeof show.poster_path === "string" && show.poster_path.length > 0
+			? `${TMDB_IMAGE_BASE_URL}${TMDB_POSTER_SIZE}${show.poster_path}`
+			: null;
+	const canonicalName = typeof show.name === "string" ? show.name : null;
+	return { thumbnail, canonicalName };
 }
 
 function safeNum(value: number | null | undefined): number {

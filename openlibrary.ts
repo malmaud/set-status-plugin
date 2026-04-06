@@ -1,100 +1,186 @@
 import { requestUrl } from "obsidian";
 
+const LOG_PREFIX = "[Set Status Plugin] [Open Library]";
 const OPENLIBRARY_SEARCH_ENDPOINT = "https://openlibrary.org/search.json";
-const OPENLIBRARY_COVER_BASE_URL = "https://covers.openlibrary.org/b/olid/";
+const OPENLIBRARY_USER_AGENT = "ObsidianStatusUpdatePlugin/0.1.0 (https://github.com/malmaud/set-status-plugin)";
 const OPENLIBRARY_COVER_SIZE = "M";
-const OPENLIBRARY_MAX_RETRIES = 3;
-const OPENLIBRARY_BASE_BACKOFF_MS = 1000;
+const OPENLIBRARY_MAX_RETRIES = 5;
+const OPENLIBRARY_BASE_BACKOFF_MS = 2000;
+
+const SEARCH_FIELDS = [
+	"key", "title", "cover_i",
+	"ratings_count", "want_to_read_count", "already_read_count",
+	"editions", "editions.key", "editions.cover_i", "editions.language",
+].join(",");
 
 export interface BookMetadata {
 	thumbnail: string | null;
 	canonicalName: string | null;
 }
 
+interface OpenLibraryEditionDoc {
+	key?: string | null;
+	cover_i?: number | null;
+	language?: string[] | null;
+}
+
 interface OpenLibraryDoc {
+	key?: string | null;
 	title?: string | null;
-	cover_edition_key?: string | null;
-	edition_key?: string[] | null;
 	cover_i?: number | null;
 	ratings_count?: number | null;
 	want_to_read_count?: number | null;
 	already_read_count?: number | null;
+	editions?: {
+		docs?: OpenLibraryEditionDoc[] | null;
+	} | null;
+}
+
+export async function searchBooks(
+	bookName: string,
+	language?: string
+): Promise<BookMetadata[]> {
+	const trimmed = bookName.trim();
+	if (!trimmed) {
+		return [];
+	}
+
+	console.info(`${LOG_PREFIX} searchBooks: query="${trimmed}", language=${language ?? "any"}`);
+
+	const params = new URLSearchParams({
+		q: trimmed,
+		fields: SEARCH_FIELDS,
+		limit: "10",
+	});
+	if (language) {
+		params.set("language", language);
+	}
+
+	const docs = await searchRequest(params);
+	console.info(`${LOG_PREFIX} searchBooks: got ${docs.length} docs from search`);
+	const ranked = rankAllBooks(docs);
+
+	const results: BookMetadata[] = ranked.map((doc) => ({
+		thumbnail: resolveCover(doc, language),
+		canonicalName: typeof doc.title === "string" ? doc.title : null,
+	}));
+	console.info(`${LOG_PREFIX} searchBooks: returning ${results.length} results (${results.filter(r => r.thumbnail).length} with covers)`);
+	return results;
 }
 
 export async function fetchBookMetadata(
-	bookName: string
+	bookName: string,
+	language?: string
 ): Promise<BookMetadata | null> {
 	const trimmed = bookName.trim();
 	if (!trimmed) {
 		return null;
 	}
 
+	console.info(`${LOG_PREFIX} fetchBookMetadata: query="${trimmed}", language=${language ?? "any"}`);
+
 	const params = new URLSearchParams({
 		q: trimmed,
-		fields:
-			"title,cover_edition_key,edition_key,cover_i,ratings_count,want_to_read_count,already_read_count",
+		fields: SEARCH_FIELDS,
 		limit: "5",
 	});
+	if (language) {
+		params.set("language", language);
+	}
 
+	const docs = await searchRequest(params);
+	const ranked = rankAllBooks(docs);
+	if (ranked.length === 0) {
+		console.info(`${LOG_PREFIX} fetchBookMetadata: no results for "${trimmed}"`);
+		return null;
+	}
+
+	const doc = ranked[0];
+	const thumbnail = resolveCover(doc, language);
+	const canonicalName = typeof doc.title === "string" ? doc.title : null;
+	console.info(`${LOG_PREFIX} fetchBookMetadata: best match "${canonicalName}", thumbnail=${thumbnail ?? "none"}`);
+	return { thumbnail, canonicalName };
+}
+
+async function searchRequest(params: URLSearchParams): Promise<OpenLibraryDoc[]> {
 	const url = `${OPENLIBRARY_SEARCH_ENDPOINT}?${params.toString()}`;
+	console.info(`${LOG_PREFIX} searchRequest: ${url}`);
 
 	for (let attempt = 1; attempt <= OPENLIBRARY_MAX_RETRIES; attempt++) {
 		try {
 			const response = await requestUrl({
 				url,
 				method: "GET",
-				headers: { Accept: "application/json" },
+				headers: { Accept: "application/json", "User-Agent": OPENLIBRARY_USER_AGENT },
 				throw: false,
 			});
+
+			console.info(`${LOG_PREFIX} searchRequest: status=${response.status} (attempt ${attempt})`);
 
 			if (response.status >= 400) {
 				if (response.status === 429 && attempt < OPENLIBRARY_MAX_RETRIES) {
 					const delayMs = OPENLIBRARY_BASE_BACKOFF_MS * 2 ** (attempt - 1);
-					console.warn(
-						`Open Library rate limited (attempt ${attempt}/${OPENLIBRARY_MAX_RETRIES}). Retrying in ${delayMs}ms.`
-					);
+					console.warn(`${LOG_PREFIX} searchRequest: rate limited, retrying in ${delayMs}ms`);
 					await delay(delayMs);
 					continue;
 				}
-				console.error(
-					`Open Library request failed (${response.status}): ${response.text ?? ""}`
-				);
-				return null;
+				console.error(`${LOG_PREFIX} searchRequest: failed with status ${response.status}`);
+				return [];
 			}
 
 			const data = response.json;
-			const docs: OpenLibraryDoc[] = Array.isArray(data?.docs)
-				? data.docs
-				: [];
-			const best = rankBooks(docs);
-			if (!best) {
-				return null;
-			}
-
-			const thumbnail = resolveCoverUrl(best);
-			const canonicalName =
-				typeof best.title === "string" ? best.title : null;
-
-			return { thumbnail, canonicalName };
+			const docs = Array.isArray(data?.docs) ? data.docs : [];
+			console.info(`${LOG_PREFIX} searchRequest: got ${docs.length} docs`);
+			return docs;
 		} catch (error) {
+			console.error(`${LOG_PREFIX} searchRequest: error (attempt ${attempt}):`, error);
 			if (attempt < OPENLIBRARY_MAX_RETRIES) {
 				const delayMs = OPENLIBRARY_BASE_BACKOFF_MS * 2 ** (attempt - 1);
-				console.warn(
-					`Open Library error (attempt ${attempt}/${OPENLIBRARY_MAX_RETRIES}). Retrying in ${delayMs}ms.`
-				);
+				console.warn(`${LOG_PREFIX} searchRequest: retrying in ${delayMs}ms`);
 				await delay(delayMs);
 				continue;
 			}
-			console.error("Failed to fetch Open Library metadata", error);
-			return null;
+			return [];
 		}
 	}
+	return [];
+}
+
+function resolveCover(doc: OpenLibraryDoc, language?: string): string | null {
+	const title = doc.title ?? "unknown";
+
+	// Try the inline edition — Open Library boosts editions matching the
+	// requested language and having a cover, so the first edition doc is
+	// typically the best match.
+	const editionDoc = doc.editions?.docs?.[0];
+	if (editionDoc) {
+		const edCover = editionDoc.cover_i;
+		if (typeof edCover === "number" && edCover > 0) {
+			const matchesLang = !language || editionDoc.language?.includes(language);
+			if (matchesLang) {
+				console.info(`${LOG_PREFIX} resolveCover: "${title}" — using edition cover ${edCover} (lang=${editionDoc.language})`);
+				return coverUrl(edCover);
+			}
+		}
+	}
+
+	// Fall back to work-level cover
+	if (typeof doc.cover_i === "number" && doc.cover_i > 0) {
+		console.info(`${LOG_PREFIX} resolveCover: "${title}" — falling back to work-level cover_i ${doc.cover_i}`);
+		return coverUrl(doc.cover_i);
+	}
+
+	console.info(`${LOG_PREFIX} resolveCover: "${title}" — no cover available`);
 	return null;
 }
 
-function rankBooks(docs: OpenLibraryDoc[]): OpenLibraryDoc | null {
+function coverUrl(coverId: number): string {
+	return `https://covers.openlibrary.org/b/id/${coverId}-${OPENLIBRARY_COVER_SIZE}.jpg`;
+}
+
+function rankAllBooks(docs: OpenLibraryDoc[]): OpenLibraryDoc[] {
 	if (docs.length === 0) {
-		return null;
+		return [];
 	}
 	const scored = docs.map((doc, index) => {
 		const ratings = safeNum(doc.ratings_count);
@@ -107,20 +193,7 @@ function rankBooks(docs: OpenLibraryDoc[]): OpenLibraryDoc | null {
 		if (b.score !== a.score) return b.score - a.score;
 		return a.index - b.index;
 	});
-	return scored[0]?.doc ?? null;
-}
-
-function resolveCoverUrl(doc: OpenLibraryDoc): string | null {
-	// Prefer cover_i (numeric cover ID) — most reliable
-	if (typeof doc.cover_i === "number" && doc.cover_i > 0) {
-		return `https://covers.openlibrary.org/b/id/${doc.cover_i}-${OPENLIBRARY_COVER_SIZE}.jpg`;
-	}
-	// Fall back to edition OLID
-	const olid = doc.cover_edition_key ?? doc.edition_key?.[0];
-	if (typeof olid === "string" && olid.length > 0) {
-		return `${OPENLIBRARY_COVER_BASE_URL}${olid}-${OPENLIBRARY_COVER_SIZE}.jpg`;
-	}
-	return null;
+	return scored.map((entry) => entry.doc);
 }
 
 function safeNum(value: number | null | undefined): number {

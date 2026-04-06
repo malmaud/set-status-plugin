@@ -1,5 +1,7 @@
 import { requestUrl } from "obsidian";
 
+const LOG_PREFIX = "[Set Status Plugin] [IGDB]";
+
 export interface IgdbConfig {
 	clientId: string;
 	accessToken: string;
@@ -71,6 +73,62 @@ export interface GameMetadata {
 	canonicalName: string | null;
 }
 
+export async function searchGames(
+	gameName: string,
+	config: IgdbConfig
+): Promise<GameMetadata[]> {
+	const trimmed = gameName.trim();
+	if (!trimmed || !config.clientId || !config.accessToken) {
+		console.info(`${LOG_PREFIX} searchGames: skipped (empty input or missing credentials)`);
+		return [];
+	}
+	console.info(`${LOG_PREFIX} searchGames: query="${trimmed}"`);
+
+	const searchTerm = sanitizeQuery(trimmed);
+	if (!searchTerm) {
+		return [];
+	}
+
+	const body =
+		`search "${searchTerm}"; fields name,cover.image_id,total_rating_count,rating_count; limit 10;`;
+
+	for (let attempt = 1; attempt <= IGDB_MAX_RETRIES; attempt++) {
+		try {
+			const response = await requestUrl({
+				url: IGDB_GAMES_ENDPOINT,
+				method: "POST",
+				headers: {
+					"Client-ID": config.clientId,
+					Authorization: `Bearer ${config.accessToken}`,
+					Accept: "application/json",
+					"Content-Type": "text/plain",
+				},
+				body,
+				throw: false,
+			});
+
+			if (response.status >= 400) {
+				if (isTooManyRequests(response.status, response.text) && attempt < IGDB_MAX_RETRIES) {
+					await delay(IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
+					continue;
+				}
+				return [];
+			}
+
+			const games = normalizeResponse(response.json, response.text);
+			return rankAllGamesByPlayedCount(games).map(gameToMetadata);
+		} catch (error) {
+			if (isTooManyRequests(undefined, undefined, error) && attempt < IGDB_MAX_RETRIES) {
+				await delay(IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
+				continue;
+			}
+			console.error("Failed to search IGDB", error);
+			return [];
+		}
+	}
+	return [];
+}
+
 export async function fetchGameMetadata(
 	gameName: string,
 	config: IgdbConfig
@@ -80,8 +138,10 @@ export async function fetchGameMetadata(
 		return null;
 	}
 	if (!config.clientId || !config.accessToken) {
+		console.info(`${LOG_PREFIX} fetchGameMetadata: skipped (missing credentials)`);
 		return null;
 	}
+	console.info(`${LOG_PREFIX} fetchGameMetadata: query="${trimmed}"`);
 
 	const searchTerm = sanitizeQuery(trimmed);
 	if (!searchTerm) {
@@ -126,22 +186,12 @@ export async function fetchGameMetadata(
 			}
 
 			const games = normalizeResponse(response.json, response.text);
-			const ranked = rankGamesByPlayedCount(games);
-			if (!ranked) {
+			const ranked = rankAllGamesByPlayedCount(games);
+			if (ranked.length === 0) {
 				return null;
 			}
 
-			const imageId = ranked.cover?.image_id;
-			const canonicalName = typeof ranked.name === "string" ? ranked.name : null;
-			const thumbnail =
-				imageId && typeof imageId === "string"
-					? `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`
-					: null;
-
-			return {
-				thumbnail,
-				canonicalName,
-			};
+			return gameToMetadata(ranked[0]);
 		} catch (error) {
 			const tooManyRequests = isTooManyRequests(undefined, undefined, error);
 			if (tooManyRequests && attempt < IGDB_MAX_RETRIES) {
@@ -183,9 +233,9 @@ function normalizeResponse(
 	return [];
 }
 
-function rankGamesByPlayedCount(games: IgdbGame[]): IgdbGame | null {
+function rankAllGamesByPlayedCount(games: IgdbGame[]): IgdbGame[] {
 	if (games.length === 0) {
-		return null;
+		return [];
 	}
 	const withCount = games.map((game, index) => {
 		const total = normalizeCountValue(game.total_rating_count);
@@ -199,7 +249,17 @@ function rankGamesByPlayedCount(games: IgdbGame[]): IgdbGame | null {
 		}
 		return a.index - b.index;
 	});
-	return withCount[0]?.game ?? null;
+	return withCount.map((entry) => entry.game);
+}
+
+function gameToMetadata(game: IgdbGame): GameMetadata {
+	const imageId = game.cover?.image_id;
+	const canonicalName = typeof game.name === "string" ? game.name : null;
+	const thumbnail =
+		imageId && typeof imageId === "string"
+			? `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`
+			: null;
+	return { thumbnail, canonicalName };
 }
 
 function normalizeCountValue(value: number | null | undefined): number {
