@@ -13,6 +13,8 @@ import {
 import * as datefns from "date-fns";
 import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
 import { fetchGameMetadata, requestIgdbAccessToken } from "./igdb";
+import { fetchBookMetadata } from "./openlibrary";
+import { fetchTvShowMetadata } from "./tmdb";
 
 interface Status {
 	name: string;
@@ -28,6 +30,7 @@ interface Settings {
 	dateFormat: string;
 	igdbClientId: string;
 	igdbClientSecret: string;
+	tmdbApiKey: string;
 }
 
 type ThumbnailUpdateStatus = "updated" | "unchanged" | "skipped";
@@ -42,6 +45,7 @@ const DEFAULT_SETTINGS: Settings = {
 	dateFormat: "yyyy-MM-dd",
 	igdbClientId: "",
 	igdbClientSecret: "",
+	tmdbApiKey: "",
 };
 
 const ITEM_TYPES: ItemType[] = [
@@ -53,6 +57,14 @@ const ITEM_TYPES: ItemType[] = [
 const GAMES_FOLDER = ITEM_TYPES.find(
 	(item) => item.label.toLowerCase() === "game"
 )	?.folder ?? "games";
+
+const BOOKS_FOLDER = ITEM_TYPES.find(
+	(item) => item.label.toLowerCase() === "book"
+)	?.folder ?? "books";
+
+const TV_SHOWS_FOLDER = ITEM_TYPES.find(
+	(item) => item.label.toLowerCase() === "tv show"
+)	?.folder ?? "tv shows";
 
 const GAME_STATUSES_WITHOUT_DATE = new Set(["complete", "abandoned"]);
 
@@ -96,15 +108,24 @@ export default class MyPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "refresh-game-thumbnails",
-			name: "Refresh game thumbnails",
-			callback: () => this.refreshGameThumbnailsCommand(),
+			id: "refresh-current-thumbnail",
+			name: "Refresh current thumbnail",
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "md") return false;
+				const folder = this.detectItemFolder(file);
+				if (!folder) return false;
+				if (!checking) {
+					this.refreshCurrentThumbnailCommand();
+				}
+				return true;
+			},
 		});
 
 		this.addCommand({
-			id: "refresh-current-game-thumbnail",
-			name: "Refresh current game thumbnail",
-			callback: () => this.refreshCurrentGameThumbnailCommand(),
+			id: "add-missing-thumbnails",
+			name: "Add missing thumbnails",
+			callback: () => this.addMissingThumbnailsCommand(),
 		});
 
 		this.addSettingTab(new SettingsTab(this.app, this));
@@ -195,23 +216,15 @@ export default class MyPlugin extends Plugin {
 
 		let displayName = trimmedName;
 		let thumbnail: string | null = null;
-		if (itemType.folder === "games") {
-			const accessToken = await this.ensureIgdbAccessToken();
-			if (accessToken) {
-				const metadata = await fetchGameMetadata(trimmedName, {
-					clientId: this.settings.igdbClientId,
-					accessToken,
-				});
-				if (metadata) {
-					if (metadata.canonicalName) {
-						const canonical = metadata.canonicalName.trim();
-						if (canonical.length > 0) {
-							displayName = canonical;
-						}
-					}
-					thumbnail = metadata.thumbnail ?? null;
+		const itemMetadata = await this.fetchMetadataForFolder(trimmedName, itemType.folder);
+		if (itemMetadata) {
+			if (itemMetadata.canonicalName) {
+				const canonical = itemMetadata.canonicalName.trim();
+				if (canonical.length > 0) {
+					displayName = canonical;
 				}
 			}
+			thumbnail = itemMetadata.thumbnail ?? null;
 		}
 
 		const sanitizeName = (value: string) =>
@@ -258,126 +271,41 @@ export default class MyPlugin extends Plugin {
 		new Notice(`Created ${filePath}`);
 	}
 
-	async refreshGameThumbnailsCommand(): Promise<void> {
-		if (!this.settings.igdbClientId || !this.settings.igdbClientSecret) {
-			new Notice(
-				"Set your IGDB client credentials in the plugin settings before refreshing thumbnails."
-			);
-			return;
-		}
-
-		const folder = this.app.vault.getAbstractFileByPath(GAMES_FOLDER);
-		if (!folder) {
-			new Notice(`Folder '${GAMES_FOLDER}' does not exist.`);
-			return;
-		}
-		if (!(folder instanceof TFolder)) {
-			new Notice(`'${GAMES_FOLDER}' exists but is not a folder.`);
-			return;
-		}
-
-		const files = this.collectMarkdownFiles(folder);
-		if (files.length === 0) {
-			new Notice(`No game notes found in '${GAMES_FOLDER}'.`);
-			return;
-		}
-
-		const accessToken = await this.ensureIgdbAccessToken();
-		if (!accessToken) {
-			return;
-		}
-
-		let updated = 0;
-		let unchanged = 0;
-		let skipped = 0;
-
-		for (const file of files) {
-			try {
-				const result = await this.updateGameNoteThumbnail(file, accessToken);
-				switch (result.status) {
-					case "updated":
-						updated++;
-						break;
-					case "unchanged":
-						unchanged++;
-						break;
-					case "skipped":
-					default:
-						skipped++;
-						if (result.reason) {
-							console.warn(
-								`[Set Status Plugin] Thumbnail refresh skipped for '${file.path}': ${result.reason}`
-							);
-						}
-						break;
-				}
-				if (result.status === "unchanged" && result.reason) {
-					console.info(
-						`[Set Status Plugin] Thumbnail already current for '${file.path}': ${result.reason}`
-					);
-				}
-			} catch (error) {
-				console.error(`Failed to update thumbnail for ${file.path}`, error);
-				skipped++;
+	private detectItemFolder(file: TFile): string | null {
+		const normalizedPath = file.path.replace(/\\/g, "/").toLowerCase();
+		for (const itemType of ITEM_TYPES) {
+			if (normalizedPath.startsWith(`${itemType.folder.toLowerCase()}/`)) {
+				return itemType.folder;
 			}
 		}
-
-		const summaryParts = [`${updated} updated`];
-		if (unchanged > 0) {
-			summaryParts.push(`${unchanged} already current`);
-		}
-		if (skipped > 0) {
-			summaryParts.push(`${skipped} skipped`);
-		}
-
-		new Notice(`Game thumbnails: ${summaryParts.join(", ")}`);
+		return null;
 	}
 
-	async refreshCurrentGameThumbnailCommand(): Promise<void> {
-		if (!this.settings.igdbClientId || !this.settings.igdbClientSecret) {
-			new Notice(
-				"Set your IGDB client credentials in the plugin settings before refreshing thumbnails."
-			);
-			return;
-		}
-
+	async refreshCurrentThumbnailCommand(): Promise<void> {
 		const file = this.app.workspace.getActiveFile();
 		if (!file || !(file instanceof TFile) || file.extension !== "md") {
-			new Notice("Open a markdown game note before refreshing its thumbnail.");
+			new Notice("Open a markdown note before refreshing its thumbnail.");
 			return;
 		}
 
-		const normalizedPath = file.path.replace(/\\/g, "/");
-		const folderPrefix = `${GAMES_FOLDER.toLowerCase()}/`;
-		if (!normalizedPath.toLowerCase().startsWith(folderPrefix)) {
-			new Notice(`Active file is not inside '${GAMES_FOLDER}'.`);
+		const folder = this.detectItemFolder(file);
+		if (!folder) {
+			new Notice("Active file is not inside a known media folder.");
 			return;
 		}
 
-		const accessToken = await this.ensureIgdbAccessToken();
-		if (!accessToken) {
-			return;
-		}
-
-		const result = await this.updateGameNoteThumbnail(file, accessToken);
+		const result = await this.updateNoteThumbnail(file, folder);
 		switch (result.status) {
 			case "updated":
-				new Notice("Thumbnail updated from IGDB.");
+				new Notice("Thumbnail updated.");
 				break;
 			case "unchanged":
-				new Notice("Thumbnail already matches the latest IGDB cover.");
-				if (result.reason) {
-					console.info(
-						`[Set Status Plugin] Thumbnail already current for '${file.path}': ${result.reason}`
-					);
-				}
+				new Notice("Thumbnail already matches the latest cover.");
 				break;
 			default:
 				new Notice("Could not update the thumbnail for this note.");
 				if (result.reason) {
-					console.warn(
-						`[Set Status Plugin] Thumbnail refresh skipped for '${file.path}': ${result.reason}`
-					);
+					console.warn(`[Set Status Plugin] Thumbnail refresh skipped for '${file.path}': ${result.reason}`);
 				}
 				break;
 		}
@@ -402,10 +330,6 @@ export default class MyPlugin extends Plugin {
 		return files;
 	}
 
-	private resolveGameName(file: TFile): string {
-		return file.basename.trim();
-	}
-
 	private upsertCoverImage(
 		content: string,
 		thumbnail: string
@@ -428,35 +352,46 @@ export default class MyPlugin extends Plugin {
 		return { text: finalContent, changed };
 	}
 
-	private async updateGameNoteThumbnail(
+	private async fetchMetadataForFolder(
+		itemName: string,
+		folder: string
+	): Promise<{ thumbnail: string | null; canonicalName: string | null } | null> {
+		if (folder === GAMES_FOLDER) {
+			const accessToken = await this.ensureIgdbAccessToken();
+			if (!accessToken) return null;
+			return fetchGameMetadata(itemName, {
+				clientId: this.settings.igdbClientId,
+				accessToken,
+			});
+		}
+		if (folder === BOOKS_FOLDER) {
+			return fetchBookMetadata(itemName);
+		}
+		if (folder === TV_SHOWS_FOLDER) {
+			if (!this.settings.tmdbApiKey) return null;
+			return fetchTvShowMetadata(itemName, this.settings.tmdbApiKey);
+		}
+		return null;
+	}
+
+	private async updateNoteThumbnail(
 		file: TFile,
-		accessToken: string
+		folder: string
 	): Promise<ThumbnailUpdateResult> {
 		const vault = this.app.vault;
 		const raw = await vault.read(file);
 		const data = extractFrontmatter(raw);
-		const gameName = this.resolveGameName(file).trim();
-		if (!gameName) {
-			return {
-				status: "skipped",
-				reason: "Could not determine a game name from frontmatter, heading, or filename.",
-			};
+		const itemName = file.basename.trim();
+		if (!itemName) {
+			return { status: "skipped", reason: "Could not determine item name from filename." };
 		}
-		const metadata = await fetchGameMetadata(gameName, {
-			clientId: this.settings.igdbClientId,
-			accessToken,
-		});
+
+		const metadata = await this.fetchMetadataForFolder(itemName, folder);
 		if (!metadata) {
-			return {
-				status: "skipped",
-				reason: `No IGDB result found for '${gameName}'.`,
-			};
+			return { status: "skipped", reason: `No result found for '${itemName}'.` };
 		}
 		if (!metadata.thumbnail) {
-			return {
-				status: "skipped",
-				reason: `IGDB result for '${gameName}' lacks a cover image.`,
-			};
+			return { status: "skipped", reason: `Result for '${itemName}' lacks a cover image.` };
 		}
 
 		const nextThumbnail = metadata.thumbnail;
@@ -468,16 +403,80 @@ export default class MyPlugin extends Plugin {
 			this.upsertCoverImage(data.content, nextThumbnail);
 		const frontmatterChanged = currentThumbnail !== nextThumbnail;
 		if (!frontmatterChanged && !contentChanged) {
-			return {
-				status: "unchanged",
-				reason: "Note already references the current IGDB thumbnail.",
-			};
+			return { status: "unchanged", reason: "Note already references the current thumbnail." };
 		}
 		data.frontmatter["thumbnail"] = nextThumbnail;
 		data.content = updatedContent;
 		const markdown = convertToMarkdown(data);
 		await vault.modify(file, markdown);
 		return { status: "updated" };
+	}
+
+	private async fileHasThumbnail(file: TFile): Promise<boolean> {
+		const raw = await this.app.vault.read(file);
+		const data = extractFrontmatter(raw);
+		return typeof data.frontmatter?.["thumbnail"] === "string" &&
+			data.frontmatter["thumbnail"].trim().length > 0;
+	}
+
+	async addMissingThumbnailsCommand(): Promise<void> {
+		const folders: { folder: string; label: string }[] = [
+			{ folder: GAMES_FOLDER, label: "game" },
+			{ folder: BOOKS_FOLDER, label: "book" },
+			{ folder: TV_SHOWS_FOLDER, label: "tv show" },
+		];
+
+		let totalUpdated = 0;
+		let totalSkipped = 0;
+		let totalAlreadyHad = 0;
+
+		for (const { folder, label } of folders) {
+			// Check credentials before processing
+			if (folder === GAMES_FOLDER && (!this.settings.igdbClientId || !this.settings.igdbClientSecret)) {
+				console.info(`[Set Status Plugin] Skipping ${label}s — IGDB credentials not configured.`);
+				continue;
+			}
+			if (folder === TV_SHOWS_FOLDER && !this.settings.tmdbApiKey) {
+				console.info(`[Set Status Plugin] Skipping ${label}s — TMDB API key not configured.`);
+				continue;
+			}
+
+			const folderObj = this.app.vault.getAbstractFileByPath(folder);
+			if (!folderObj || !(folderObj instanceof TFolder)) {
+				continue;
+			}
+
+			const files = this.collectMarkdownFiles(folderObj);
+			for (const file of files) {
+				try {
+					if (await this.fileHasThumbnail(file)) {
+						totalAlreadyHad++;
+						continue;
+					}
+
+					const result = await this.updateNoteThumbnail(file, folder);
+
+					switch (result.status) {
+						case "updated": totalUpdated++; break;
+						case "unchanged": totalAlreadyHad++; break;
+						default:
+							totalSkipped++;
+							if (result.reason) {
+								console.warn(`[Set Status Plugin] Skipped '${file.path}': ${result.reason}`);
+							}
+							break;
+					}
+				} catch (error) {
+					console.error(`Failed to add thumbnail for ${file.path}`, error);
+					totalSkipped++;
+				}
+			}
+		}
+
+		const parts = [`${totalUpdated} added`];
+		if (totalAlreadyHad > 0) parts.push(`${totalAlreadyHad} already had one`);
+		if (totalSkipped > 0) parts.push(`${totalSkipped} skipped`);
+		new Notice(`Missing thumbnails: ${parts.join(", ")}`);
 	}
 
 	private async ensureIgdbAccessToken(): Promise<string | null> {
@@ -796,6 +795,47 @@ class SettingsTab extends PluginSettingTab {
 		this.plugin.clearIgdbTokenCache();
 	}
 
+	getTmdbApiKey(): string {
+		return this.plugin.settings.tmdbApiKey;
+	}
+
+	async setTmdbApiKey(value: string): Promise<void> {
+		this.plugin.settings.tmdbApiKey = value.trim();
+		await this.plugin.saveSettings();
+	}
+
+	private createStatusIndicator(containerEl: HTMLElement): HTMLElement {
+		const indicator = containerEl.createSpan({ cls: "setting-status-indicator" });
+		indicator.style.marginLeft = "8px";
+		indicator.style.fontSize = "0.85em";
+		return indicator;
+	}
+
+	private setIndicator(el: HTMLElement, state: "configured" | "not-configured" | "valid" | "invalid" | "checking") {
+		switch (state) {
+			case "configured":
+				el.setText("Configured");
+				el.style.color = "var(--text-muted)";
+				break;
+			case "not-configured":
+				el.setText("Not configured");
+				el.style.color = "var(--text-faint)";
+				break;
+			case "valid":
+				el.setText("Valid");
+				el.style.color = "var(--color-green)";
+				break;
+			case "invalid":
+				el.setText("Invalid");
+				el.style.color = "var(--color-red)";
+				break;
+			case "checking":
+				el.setText("Checking...");
+				el.style.color = "var(--text-muted)";
+				break;
+		}
+	}
+
 	display(): void {
 		const containerEl = this.containerEl;
 		containerEl.empty();
@@ -817,9 +857,16 @@ class SettingsTab extends PluginSettingTab {
 				.setValue(this.getDateFormat())
 				.onChange(async (value) => await this.setDateFormat(value));
 		});
-		new Setting(containerEl)
+
+		// --- IGDB ---
+		const igdbHeading = new Setting(containerEl)
 			.setHeading()
-			.setName("IGDB API");
+			.setName("IGDB API (Games)");
+		const igdbIndicator = this.createStatusIndicator(igdbHeading.nameEl);
+		this.setIndicator(igdbIndicator,
+			this.getIgdbClientId() && this.getIgdbClientSecret() ? "configured" : "not-configured"
+		);
+
 		new Setting(containerEl)
 			.setName("Client ID")
 			.setDesc("Required to look up covers via the IGDB API.")
@@ -828,18 +875,103 @@ class SettingsTab extends PluginSettingTab {
 					.setValue(this.getIgdbClientId())
 					.onChange(async (value) => {
 						await this.setIgdbClientId(value);
+						this.setIndicator(igdbIndicator,
+							value.trim() && this.getIgdbClientSecret() ? "configured" : "not-configured"
+						);
 					});
 			});
 		new Setting(containerEl)
 			.setName("Client secret")
-			.setDesc("Stored securely in your vault and used to request short-lived IGDB tokens as needed.")
+			.setDesc("Used to request short-lived IGDB tokens as needed.")
 			.addText((text) => {
 				text.setPlaceholder("Enter IGDB client secret")
 					.setValue(this.getIgdbClientSecret())
 					.onChange(async (value) => {
 						await this.setIgdbClientSecret(value);
+						this.setIndicator(igdbIndicator,
+							this.getIgdbClientId() && value.trim() ? "configured" : "not-configured"
+						);
 					});
 				text.inputEl.type = "password";
 			});
+		new Setting(containerEl)
+			.setName("Test connection")
+			.setDesc("Verify your IGDB credentials by requesting an access token.")
+			.addButton((button) => {
+				button.setButtonText("Test").onClick(async () => {
+					const clientId = this.getIgdbClientId();
+					const clientSecret = this.getIgdbClientSecret();
+					if (!clientId || !clientSecret) {
+						this.setIndicator(igdbIndicator, "not-configured");
+						new Notice("Enter both Client ID and Client secret first.");
+						return;
+					}
+					this.setIndicator(igdbIndicator, "checking");
+					const token = await requestIgdbAccessToken(clientId, clientSecret);
+					if (token) {
+						this.setIndicator(igdbIndicator, "valid");
+						new Notice("IGDB credentials are valid.");
+					} else {
+						this.setIndicator(igdbIndicator, "invalid");
+						new Notice("IGDB credentials are invalid. Check your Client ID and secret.");
+					}
+				});
+			});
+
+		// --- TMDB ---
+		const tmdbHeading = new Setting(containerEl)
+			.setHeading()
+			.setName("TMDB API (TV Shows)");
+		const tmdbIndicator = this.createStatusIndicator(tmdbHeading.nameEl);
+		this.setIndicator(tmdbIndicator,
+			this.getTmdbApiKey() ? "configured" : "not-configured"
+		);
+
+		new Setting(containerEl)
+			.setName("API key")
+			.setDesc("Required to look up TV show posters via TMDB. Get a free key at themoviedb.org.")
+			.addText((text) => {
+				text.setPlaceholder("Enter TMDB API key")
+					.setValue(this.getTmdbApiKey())
+					.onChange(async (value) => {
+						await this.setTmdbApiKey(value);
+						this.setIndicator(tmdbIndicator,
+							value.trim() ? "configured" : "not-configured"
+						);
+					});
+				text.inputEl.type = "password";
+			});
+		new Setting(containerEl)
+			.setName("Test connection")
+			.setDesc("Verify your TMDB API key with a test query.")
+			.addButton((button) => {
+				button.setButtonText("Test").onClick(async () => {
+					const apiKey = this.getTmdbApiKey();
+					if (!apiKey) {
+						this.setIndicator(tmdbIndicator, "not-configured");
+						new Notice("Enter a TMDB API key first.");
+						return;
+					}
+					this.setIndicator(tmdbIndicator, "checking");
+					const result = await fetchTvShowMetadata("Breaking Bad", apiKey);
+					if (result) {
+						this.setIndicator(tmdbIndicator, "valid");
+						new Notice("TMDB API key is valid.");
+					} else {
+						this.setIndicator(tmdbIndicator, "invalid");
+						new Notice("TMDB API key appears invalid. Check it and try again.");
+					}
+				});
+			});
+
+		// --- Open Library ---
+		const olHeading = new Setting(containerEl)
+			.setHeading()
+			.setName("Open Library (Books)");
+		const olIndicator = this.createStatusIndicator(olHeading.nameEl);
+		this.setIndicator(olIndicator, "valid");
+
+		new Setting(containerEl)
+			.setDesc("Open Library requires no API key. Book cover lookups are always available.");
 	}
 }
