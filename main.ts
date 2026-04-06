@@ -11,7 +11,7 @@ import {
 	TextComponent,
 } from "obsidian";
 import * as datefns from "date-fns";
-import { extractFrontmatter, convertToMarkdown, DocumentData } from "./frontmatter";
+import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
 import { fetchGameMetadata, requestIgdbAccessToken } from "./igdb";
 
 interface Status {
@@ -57,7 +57,7 @@ const GAMES_FOLDER = ITEM_TYPES.find(
 const GAME_STATUSES_WITHOUT_DATE = new Set(["complete", "abandoned"]);
 
 export default class MyPlugin extends Plugin {
-	settings: Settings;
+	settings!: Settings;
 	private igdbToken: { value: string; expiresAt: number } | null = null;
 
 	async onload() {
@@ -79,6 +79,9 @@ export default class MyPlugin extends Plugin {
 				return true;
 			},
 		});
+
+		this.registerStatusCommands();
+
 		this.addRibbonIcon("circle-check", "Set status", () =>
 			this.openStatusChangeModal()
 		);
@@ -105,6 +108,26 @@ export default class MyPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new SettingsTab(this.app, this));
+	}
+
+	private registerStatusCommands() {
+		for (const statusName of this.settings.statusNames) {
+			const id = `set-status-${statusName.toLowerCase().replace(/\s+/g, "-")}`;
+			this.addCommand({
+				id,
+				name: statusName,
+				checkCallback: (checking: boolean) => {
+					const file = this.app.workspace.getActiveFile();
+					if (!file) {
+						return false;
+					}
+					if (!checking) {
+						this.setStatus({ name: statusName });
+					}
+					return true;
+				},
+			});
+		}
 	}
 
 	async loadSettings(): Promise<Settings> {
@@ -389,7 +412,7 @@ export default class MyPlugin extends Plugin {
 	): { text: string; changed: boolean } {
 		const coverLine = `![Cover Image](${thumbnail})`;
 		const normalizedOriginal = content.replace(/\r\n/g, "\n");
-		const imageRegex = /!\[[^\]]*]\([^\)]+\)/g;
+		const imageRegex = /!\[[^\]]*]\([^)]+\)/g;
 		const withoutImages = normalizedOriginal.replace(imageRegex, "");
 		const trimmedLeading = withoutImages.replace(/^\n+/, "");
 		const trimmedTrailing = trimmedLeading.replace(/\s+$/, "");
