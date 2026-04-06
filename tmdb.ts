@@ -1,7 +1,7 @@
 import { requestUrl } from "obsidian";
 
 const LOG_PREFIX = "[Set Status Plugin] [TMDB]";
-const TMDB_SEARCH_ENDPOINT = "https://api.themoviedb.org/3/search/tv";
+const TMDB_SEARCH_ENDPOINT = "https://api.themoviedb.org/3/search/multi";
 const TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/";
 const TMDB_POSTER_SIZE = "w500";
 const TMDB_MAX_RETRIES = 3;
@@ -13,9 +13,11 @@ export interface TvShowMetadata {
 	canonicalName: string | null;
 }
 
-interface TmdbTvResult {
+interface TmdbResult {
 	id?: number | null;
+	media_type?: string | null;
 	name?: string | null;
+	title?: string | null;
 	poster_path?: string | null;
 	popularity?: number | null;
 	vote_count?: number | null;
@@ -32,7 +34,21 @@ export async function searchTvShows(
 	}
 
 	const query = stripSeasonSuffix(trimmed);
-	console.info(`${LOG_PREFIX} searchTvShows: query="${query}" (original="${trimmed}")`);
+	const results = await tmdbSearch(query, apiKey);
+	if (results.length > 0) {
+		return results;
+	}
+
+	const loose = loosen(query);
+	if (loose !== query) {
+		console.info(`${LOG_PREFIX} searchTvShows: retrying with loosened query="${loose}"`);
+		return tmdbSearch(loose, apiKey);
+	}
+	return [];
+}
+
+async function tmdbSearch(query: string, apiKey: string): Promise<TvShowMetadata[]> {
+	console.info(`${LOG_PREFIX} tmdbSearch: query="${query}"`);
 
 	const params = new URLSearchParams({
 		api_key: apiKey,
@@ -50,7 +66,7 @@ export async function searchTvShows(
 				throw: false,
 			});
 
-			console.info(`${LOG_PREFIX} searchTvShows: status=${response.status} (attempt ${attempt})`);
+			console.info(`${LOG_PREFIX} tmdbSearch: status=${response.status} (attempt ${attempt})`);
 
 			if (response.status >= 400) {
 				if (response.status === 429 && attempt < TMDB_MAX_RETRIES) {
@@ -61,14 +77,14 @@ export async function searchTvShows(
 			}
 
 			const data = response.json;
-			const results: TmdbTvResult[] = Array.isArray(data?.results)
+			const results: TmdbResult[] = Array.isArray(data?.results)
 				? data.results
 				: [];
-			const mapped = rankAllTvShows(results).map(showToMetadata);
-			console.info(`${LOG_PREFIX} searchTvShows: returning ${mapped.length} results`);
+			const mapped = rankAllResults(results).map(resultToMetadata);
+			console.info(`${LOG_PREFIX} tmdbSearch: returning ${mapped.length} results`);
 			return mapped;
 		} catch (error) {
-			console.error(`${LOG_PREFIX} searchTvShows: error (attempt ${attempt}):`, error);
+			console.error(`${LOG_PREFIX} tmdbSearch: error (attempt ${attempt}):`, error);
 			if (attempt < TMDB_MAX_RETRIES) {
 				await delay(TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
 				continue;
@@ -90,70 +106,29 @@ export async function fetchTvShowMetadata(
 	}
 
 	const query = stripSeasonSuffix(trimmed);
-	console.info(`${LOG_PREFIX} fetchTvShowMetadata: query="${query}" (original="${trimmed}")`);
+	const results = await tmdbSearch(query, apiKey);
+	if (results.length > 0) {
+		return results[0];
+	}
 
-	const params = new URLSearchParams({
-		api_key: apiKey,
-		query,
-	});
-
-	const url = `${TMDB_SEARCH_ENDPOINT}?${params.toString()}`;
-
-	for (let attempt = 1; attempt <= TMDB_MAX_RETRIES; attempt++) {
-		try {
-			const response = await requestUrl({
-				url,
-				method: "GET",
-				headers: { Accept: "application/json" },
-				throw: false,
-			});
-
-			if (response.status >= 400) {
-				if (response.status === 429 && attempt < TMDB_MAX_RETRIES) {
-					const delayMs = TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
-					console.warn(
-						`TMDB rate limited (attempt ${attempt}/${TMDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
-					);
-					await delay(delayMs);
-					continue;
-				}
-				console.error(
-					`TMDB request failed (${response.status}): ${response.text ?? ""}`
-				);
-				return null;
-			}
-
-			const data = response.json;
-			const results: TmdbTvResult[] = Array.isArray(data?.results)
-				? data.results
-				: [];
-			const ranked = rankAllTvShows(results);
-			if (ranked.length === 0) {
-				return null;
-			}
-
-			return showToMetadata(ranked[0]);
-		} catch (error) {
-			if (attempt < TMDB_MAX_RETRIES) {
-				const delayMs = TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
-				console.warn(
-					`TMDB error (attempt ${attempt}/${TMDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
-				);
-				await delay(delayMs);
-				continue;
-			}
-			console.error("Failed to fetch TMDB metadata", error);
-			return null;
-		}
+	const loose = loosen(query);
+	if (loose !== query) {
+		console.info(`${LOG_PREFIX} fetchTvShowMetadata: retrying with loosened query="${loose}"`);
+		const looseResults = await tmdbSearch(loose, apiKey);
+		return looseResults.length > 0 ? looseResults[0] : null;
 	}
 	return null;
 }
 
-function rankAllTvShows(results: TmdbTvResult[]): TmdbTvResult[] {
+function rankAllResults(results: TmdbResult[]): TmdbResult[] {
 	if (results.length === 0) {
 		return [];
 	}
-	const scored = results.map((show, index) => {
+	// Filter to only movies and TV shows (multi search also returns people)
+	const mediaOnly = results.filter(
+		(r) => r.media_type === "movie" || r.media_type === "tv"
+	);
+	const scored = mediaOnly.map((show, index) => {
 		const popularity = safeNum(show.popularity);
 		const voteCount = safeNum(show.vote_count);
 		const score = popularity + voteCount;
@@ -166,18 +141,29 @@ function rankAllTvShows(results: TmdbTvResult[]): TmdbTvResult[] {
 	return scored.map((entry) => entry.show);
 }
 
-function showToMetadata(show: TmdbTvResult): TvShowMetadata {
+function resultToMetadata(result: TmdbResult): TvShowMetadata {
 	const thumbnail =
-		typeof show.poster_path === "string" && show.poster_path.length > 0
-			? `${TMDB_IMAGE_BASE_URL}${TMDB_POSTER_SIZE}${show.poster_path}`
+		typeof result.poster_path === "string" && result.poster_path.length > 0
+			? `${TMDB_IMAGE_BASE_URL}${TMDB_POSTER_SIZE}${result.poster_path}`
 			: null;
-	const canonicalName = typeof show.name === "string" ? show.name : null;
-	const id = typeof show.id === "number" ? `https://www.themoviedb.org/tv/${show.id}` : null;
+	const canonicalName =
+		typeof result.title === "string" ? result.title
+		: typeof result.name === "string" ? result.name
+		: null;
+	const mediaPath = result.media_type === "movie" ? "movie" : "tv";
+	const id = typeof result.id === "number" ? `https://www.themoviedb.org/${mediaPath}/${result.id}` : null;
 	return { id, thumbnail, canonicalName };
 }
 
 function safeNum(value: number | null | undefined): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+export function loosen(query: string): string {
+	return query
+		.replace(/[^\w\s]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
 export function stripSeasonSuffix(name: string): string {

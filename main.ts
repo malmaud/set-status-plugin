@@ -15,6 +15,7 @@ import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
 import { fetchGameMetadata, searchGames, requestIgdbAccessToken } from "./igdb";
 import { fetchBookMetadata, searchBooks } from "./openlibrary";
 import { fetchTvShowMetadata, searchTvShows } from "./tmdb";
+import { rerankResults, testClaudeApiKey, correctTitle } from "./rerank";
 
 interface Status {
 	name: string;
@@ -32,6 +33,8 @@ interface Settings {
 	igdbClientSecret: string;
 	tmdbApiKey: string;
 	bookLanguage: string;
+	claudeApiKey: string;
+	claudeModel: string;
 }
 
 type ThumbnailUpdateStatus = "updated" | "unchanged" | "skipped";
@@ -48,6 +51,8 @@ const DEFAULT_SETTINGS: Settings = {
 	igdbClientSecret: "",
 	tmdbApiKey: "",
 	bookLanguage: "eng",
+	claudeApiKey: "",
+	claudeModel: "claude-haiku-4-5-20251001",
 };
 
 const ITEM_TYPES: ItemType[] = [
@@ -306,34 +311,55 @@ export default class MyPlugin extends Plugin {
 
 	private async searchForFolder(
 		itemName: string,
-		folder: string
+		folder: string,
+		author?: string,
+		isRetry = false
 	): Promise<{ id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null }[]> {
-		console.info(`[Set Status Plugin] searchForFolder: "${itemName}" in "${folder}"`);
+		console.info(`[Set Status Plugin] searchForFolder: "${itemName}" in "${folder}"${author ? ` (author="${author}")` : ""}`);
+		let results: { id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null }[];
 		if (folder === GAMES_FOLDER) {
 			const accessToken = await this.ensureIgdbAccessToken();
 			if (!accessToken) {
 				console.warn("[Set Status Plugin] searchForFolder: no IGDB access token");
 				return [];
 			}
-			return searchGames(itemName, {
+			results = await searchGames(itemName, {
 				clientId: this.settings.igdbClientId,
 				accessToken,
 			});
-		}
-		if (folder === BOOKS_FOLDER) {
+		} else if (folder === BOOKS_FOLDER) {
 			const lang = this.settings.bookLanguage || undefined;
+			const bookQuery = author ? `${itemName} ${author}` : itemName;
 			console.info(`[Set Status Plugin] searchForFolder: using book language="${lang ?? "any"}"`);
-			return searchBooks(itemName, lang);
-		}
-		if (folder === TV_SHOWS_FOLDER) {
+			results = await searchBooks(bookQuery, lang);
+		} else if (folder === TV_SHOWS_FOLDER) {
 			if (!this.settings.tmdbApiKey) {
 				console.warn("[Set Status Plugin] searchForFolder: no TMDB API key");
 				return [];
 			}
-			return searchTvShows(itemName, this.settings.tmdbApiKey);
+			results = await searchTvShows(itemName, this.settings.tmdbApiKey);
+		} else {
+			console.warn(`[Set Status Plugin] searchForFolder: unknown folder "${folder}"`);
+			return [];
 		}
-		console.warn(`[Set Status Plugin] searchForFolder: unknown folder "${folder}"`);
-		return [];
+
+		if (this.settings.claudeApiKey) {
+			if (results.length === 0 && !isRetry) {
+				new Notice("No results — asking Claude to identify the title...");
+				const mediaType = ITEM_TYPES.find((t) => t.folder === folder)?.label ?? "media";
+				const corrected = await correctTitle(itemName, mediaType, this.settings.claudeApiKey, this.settings.claudeModel);
+				if (corrected && corrected.toLowerCase() !== itemName.toLowerCase()) {
+					new Notice(`Searching for "${corrected}"...`);
+					console.info(`[Set Status Plugin] searchForFolder: retrying with corrected title "${corrected}"`);
+					return this.searchForFolder(corrected, folder, author, true);
+				}
+			} else if (results.length > 1) {
+				new Notice("Ranking results with Claude...");
+				results = await rerankResults(itemName, results, this.settings.claudeApiKey, this.settings.claudeModel);
+			}
+		}
+
+		return results;
 	}
 
 	private applyThumbnail(
@@ -385,10 +411,21 @@ export default class MyPlugin extends Plugin {
 			return;
 		}
 
+		let author: string | undefined;
+		if (folder === BOOKS_FOLDER) {
+			const raw = await this.app.vault.read(file);
+			const data = extractFrontmatter(raw);
+			const val = data.frontmatter?.["author"];
+			if (typeof val === "string" && val.trim()) {
+				author = val.trim();
+			}
+		}
+
 		console.info(`[Set Status Plugin] pickThumbnail: "${itemName}" in "${folder}"`);
-		new Notice("Searching...");
+		const searchNotice = new Notice(`Searching for "${itemName}"...`, 0);
 		try {
-			const results = await this.searchForFolder(itemName, folder);
+			const results = await this.searchForFolder(itemName, folder, author);
+			searchNotice.hide();
 			console.info(`[Set Status Plugin] pickThumbnail: got ${results.length} results`);
 			if (results.length === 0) {
 				new Notice(`No results found for "${itemName}".`);
@@ -408,6 +445,7 @@ export default class MyPlugin extends Plugin {
 				(choice) => this.applyThumbnail(file, choice)
 			).open();
 		} catch (error) {
+			searchNotice.hide();
 			console.error("[Set Status Plugin] pickThumbnail failed:", error);
 			new Notice("Failed to search for thumbnails. Check the console for details.");
 		}
@@ -486,7 +524,8 @@ export default class MyPlugin extends Plugin {
 
 	private async fetchMetadataForFolder(
 		itemName: string,
-		folder: string
+		folder: string,
+		author?: string
 	): Promise<{ id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null } | null> {
 		if (folder === GAMES_FOLDER) {
 			const accessToken = await this.ensureIgdbAccessToken();
@@ -497,11 +536,22 @@ export default class MyPlugin extends Plugin {
 			});
 		}
 		if (folder === BOOKS_FOLDER) {
-			return fetchBookMetadata(itemName, this.settings.bookLanguage || undefined);
+			const bookQuery = author ? `${itemName} ${author}` : itemName;
+			return fetchBookMetadata(bookQuery, this.settings.bookLanguage || undefined);
 		}
 		if (folder === TV_SHOWS_FOLDER) {
 			if (!this.settings.tmdbApiKey) return null;
-			return fetchTvShowMetadata(itemName, this.settings.tmdbApiKey);
+			const result = await fetchTvShowMetadata(itemName, this.settings.tmdbApiKey);
+			if (result) return result;
+
+			if (this.settings.claudeApiKey) {
+				const corrected = await correctTitle(itemName, "TV Show", this.settings.claudeApiKey, this.settings.claudeModel);
+				if (corrected && corrected.toLowerCase() !== itemName.toLowerCase()) {
+					console.info(`[Set Status Plugin] fetchMetadataForFolder: retrying with corrected title "${corrected}"`);
+					return fetchTvShowMetadata(corrected, this.settings.tmdbApiKey);
+				}
+			}
+			return null;
 		}
 		return null;
 	}
@@ -518,7 +568,15 @@ export default class MyPlugin extends Plugin {
 			return { status: "skipped", reason: "Could not determine item name from filename." };
 		}
 
-		const metadata = await this.fetchMetadataForFolder(itemName, folder);
+		let existingAuthor: string | undefined;
+		if (folder === BOOKS_FOLDER) {
+			const val = data.frontmatter?.["author"];
+			if (typeof val === "string" && val.trim()) {
+				existingAuthor = val.trim();
+			}
+		}
+
+		const metadata = await this.fetchMetadataForFolder(itemName, folder, existingAuthor);
 		if (!metadata) {
 			return { status: "skipped", reason: `No result found for '${itemName}'.` };
 		}
@@ -1197,6 +1255,70 @@ class SettingsTab extends PluginSettingTab {
 						this.plugin.settings.bookLanguage = value.trim().toLowerCase();
 						await this.plugin.saveSettings();
 					});
+			});
+
+		// --- Claude AI (Optional) ---
+		const claudeHeading = new Setting(containerEl)
+			.setHeading()
+			.setName("Claude AI (Optional)");
+		const claudeIndicator = this.createStatusIndicator(claudeHeading.nameEl);
+		this.setIndicator(claudeIndicator,
+			this.plugin.settings.claudeApiKey ? "configured" : "not-configured"
+		);
+
+		new Setting(containerEl)
+			.setDesc("Provide a Claude API key to use AI-powered reranking of search results when picking thumbnails.");
+
+		new Setting(containerEl)
+			.setName("API Key")
+			.addText((text) => {
+				text.inputEl.type = "password";
+				text.setPlaceholder("sk-ant-...")
+					.setValue(this.plugin.settings.claudeApiKey)
+					.onChange(async (value) => {
+						this.plugin.settings.claudeApiKey = value.trim();
+						await this.plugin.saveSettings();
+						this.setIndicator(claudeIndicator,
+							value.trim() ? "configured" : "not-configured"
+						);
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("Model")
+			.addDropdown((dropdown) => {
+				dropdown
+					.addOption("claude-haiku-4-5-20251001", "Haiku 4.5 (fastest, cheapest)")
+					.addOption("claude-sonnet-4-6", "Sonnet 4.6")
+					.addOption("claude-opus-4-6", "Opus 4.6 (smartest)")
+					.setValue(this.plugin.settings.claudeModel)
+					.onChange(async (value) => {
+						this.plugin.settings.claudeModel = value;
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("Test connection")
+			.setDesc("Verify your Claude API key by sending a test request.")
+			.addButton((button) => {
+				button.setButtonText("Test").onClick(async () => {
+					const key = this.plugin.settings.claudeApiKey;
+					if (!key) {
+						this.setIndicator(claudeIndicator, "not-configured");
+						new Notice("Enter a Claude API key first.");
+						return;
+					}
+					this.setIndicator(claudeIndicator, "checking");
+					const result = await testClaudeApiKey(key, this.plugin.settings.claudeModel);
+					if (result.ok) {
+						this.setIndicator(claudeIndicator, "valid");
+						new Notice("Claude API key is valid.");
+					} else {
+						this.setIndicator(claudeIndicator, "invalid");
+						new Notice(`Claude API key test failed: ${result.error ?? "Unknown error"}`);
+					}
+				});
 			});
 	}
 }
