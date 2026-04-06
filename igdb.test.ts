@@ -46,6 +46,7 @@ describe("fetchGameMetadata", () => {
 			json: [
 				{
 					name: "Hades",
+					url: "https://www.igdb.com/games/hades",
 					cover: { image_id: "co1abc" },
 					total_rating_count: 1000,
 					rating_count: 500,
@@ -59,6 +60,7 @@ describe("fetchGameMetadata", () => {
 		expect(result!.thumbnail).toBe(
 			"https://images.igdb.com/igdb/image/upload/t_cover_big/co1abc.jpg"
 		);
+		expect(result!.id).toBe("https://www.igdb.com/games/hades");
 	});
 
 	it("ranks results by play count", async () => {
@@ -99,6 +101,22 @@ describe("fetchGameMetadata", () => {
 		const result = await fetchGameMetadata("no cover", CONFIG);
 		expect(result!.canonicalName).toBe("No Cover Game");
 		expect(result!.thumbnail).toBeNull();
+	});
+
+	it("returns null id when url is missing", async () => {
+		mockRequestUrl.mockResolvedValue({
+			status: 200,
+			json: [
+				{
+					name: "No URL Game",
+					cover: { image_id: "co1abc" },
+					total_rating_count: 10,
+				},
+			],
+		});
+
+		const result = await fetchGameMetadata("no url", CONFIG);
+		expect(result!.id).toBeNull();
 	});
 
 	it("returns null when no results are returned", async () => {
@@ -174,13 +192,13 @@ describe("searchGames", () => {
 		expect(await searchGames("", CONFIG)).toEqual([]);
 	});
 
-	it("returns multiple ranked results", async () => {
+	it("returns multiple ranked results with ids", async () => {
 		mockRequestUrl.mockResolvedValue({
 			status: 200,
 			json: [
-				{ name: "Game A", cover: { image_id: "a1" }, total_rating_count: 10 },
-				{ name: "Game B", cover: { image_id: "b1" }, total_rating_count: 500 },
-				{ name: "Game C", cover: { image_id: "c1" }, total_rating_count: 100 },
+				{ name: "Game A", url: "https://www.igdb.com/games/game-a", cover: { image_id: "a1" }, total_rating_count: 10 },
+				{ name: "Game B", url: "https://www.igdb.com/games/game-b", cover: { image_id: "b1" }, total_rating_count: 500 },
+				{ name: "Game C", url: "https://www.igdb.com/games/game-c", cover: { image_id: "c1" }, total_rating_count: 100 },
 			],
 		});
 
@@ -190,6 +208,7 @@ describe("searchGames", () => {
 		expect(results[1].canonicalName).toBe("Game C");
 		expect(results[2].canonicalName).toBe("Game A");
 		expect(results[0].thumbnail).toContain("b1");
+		expect(results[0].id).toBe("https://www.igdb.com/games/game-b");
 	});
 
 	it("returns empty array on error", async () => {

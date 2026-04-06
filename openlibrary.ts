@@ -8,14 +8,16 @@ const OPENLIBRARY_MAX_RETRIES = 5;
 const OPENLIBRARY_BASE_BACKOFF_MS = 2000;
 
 const SEARCH_FIELDS = [
-	"key", "title", "cover_i",
+	"key", "title", "author_name", "cover_i",
 	"ratings_count", "want_to_read_count", "already_read_count",
 	"editions", "editions.key", "editions.cover_i", "editions.language",
 ].join(",");
 
 export interface BookMetadata {
+	id: string | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
+	author: string | null;
 }
 
 interface OpenLibraryEditionDoc {
@@ -27,6 +29,7 @@ interface OpenLibraryEditionDoc {
 interface OpenLibraryDoc {
 	key?: string | null;
 	title?: string | null;
+	author_name?: string[] | null;
 	cover_i?: number | null;
 	ratings_count?: number | null;
 	want_to_read_count?: number | null;
@@ -61,8 +64,10 @@ export async function searchBooks(
 	const ranked = rankAllBooks(docs);
 
 	const results: BookMetadata[] = ranked.map((doc) => ({
+		id: typeof doc.key === "string" ? `https://openlibrary.org${doc.key}` : null,
 		thumbnail: resolveCover(doc, language),
 		canonicalName: typeof doc.title === "string" ? doc.title : null,
+		author: resolveAuthor(doc),
 	}));
 	console.info(`${LOG_PREFIX} searchBooks: returning ${results.length} results (${results.filter(r => r.thumbnail).length} with covers)`);
 	return results;
@@ -96,10 +101,12 @@ export async function fetchBookMetadata(
 	}
 
 	const doc = ranked[0];
+	const id = typeof doc.key === "string" ? `https://openlibrary.org${doc.key}` : null;
 	const thumbnail = resolveCover(doc, language);
 	const canonicalName = typeof doc.title === "string" ? doc.title : null;
+	const author = resolveAuthor(doc);
 	console.info(`${LOG_PREFIX} fetchBookMetadata: best match "${canonicalName}", thumbnail=${thumbnail ?? "none"}`);
-	return { thumbnail, canonicalName };
+	return { id, thumbnail, canonicalName, author };
 }
 
 async function searchRequest(params: URLSearchParams): Promise<OpenLibraryDoc[]> {
@@ -174,6 +181,24 @@ function resolveCover(doc: OpenLibraryDoc, language?: string): string | null {
 	return null;
 }
 
+function resolveAuthor(doc: OpenLibraryDoc): string | null {
+	const names = doc.author_name;
+	if (Array.isArray(names) && names.length > 0 && typeof names[0] === "string") {
+		return toLastFirst(names[0]);
+	}
+	return null;
+}
+
+function toLastFirst(name: string): string {
+	const parts = name.trim().split(/\s+/);
+	if (parts.length < 2) {
+		return name.trim();
+	}
+	const last = parts[parts.length - 1];
+	const rest = parts.slice(0, -1).join(" ");
+	return `${last}, ${rest}`;
+}
+
 function coverUrl(coverId: number): string {
 	return `https://covers.openlibrary.org/b/id/${coverId}-${OPENLIBRARY_COVER_SIZE}.jpg`;
 }
@@ -182,11 +207,28 @@ function rankAllBooks(docs: OpenLibraryDoc[]): OpenLibraryDoc[] {
 	if (docs.length === 0) {
 		return [];
 	}
-	const scored = docs.map((doc, index) => {
+
+	// Build a popularity rank (0 = most popular)
+	const byPopularity = docs.map((doc, index) => {
 		const ratings = safeNum(doc.ratings_count);
 		const wantToRead = safeNum(doc.want_to_read_count);
 		const alreadyRead = safeNum(doc.already_read_count);
-		const score = ratings + wantToRead + alreadyRead;
+		return { index, popularity: ratings + wantToRead + alreadyRead };
+	});
+	byPopularity.sort((a, b) => b.popularity - a.popularity);
+	const popularityRank = new Map<number, number>();
+	byPopularity.forEach((entry, rank) => popularityRank.set(entry.index, rank));
+
+	// Reciprocal rank fusion: combine API relevance rank with popularity rank.
+	// Relevance is weighted 2× because the API's search ordering already
+	// reflects query match quality, while popularity alone can surface
+	// unrelated classics (e.g. the Bible for "god of the woods").
+	const k = 2;
+	const relevanceWeight = 2;
+	const scored = docs.map((doc, index) => {
+		const relevanceScore = relevanceWeight / (k + index);
+		const popScore = 1 / (k + popularityRank.get(index)!);
+		const score = relevanceScore + popScore;
 		return { doc, score, index };
 	});
 	scored.sort((a, b) => {

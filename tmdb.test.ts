@@ -25,12 +25,13 @@ describe("fetchTvShowMetadata", () => {
 		expect(mockRequestUrl).not.toHaveBeenCalled();
 	});
 
-	it("returns thumbnail and canonical name for a valid result", async () => {
+	it("returns thumbnail, canonical name, and id for a valid result", async () => {
 		mockRequestUrl.mockResolvedValue({
 			status: 200,
 			json: {
 				results: [
 					{
+						id: 1396,
 						name: "Breaking Bad",
 						poster_path: "/ggFHVNu6YYI5L9pCfOacjizRGt.jpg",
 						popularity: 200,
@@ -46,6 +47,7 @@ describe("fetchTvShowMetadata", () => {
 		expect(result!.thumbnail).toBe(
 			"https://image.tmdb.org/t/p/w500/ggFHVNu6YYI5L9pCfOacjizRGt.jpg"
 		);
+		expect(result!.id).toBe("https://www.themoviedb.org/tv/1396");
 	});
 
 	it("ranks results by popularity + vote count", async () => {
@@ -91,6 +93,25 @@ describe("fetchTvShowMetadata", () => {
 		const result = await fetchTvShowMetadata("no poster", API_KEY);
 		expect(result!.canonicalName).toBe("No Poster Show");
 		expect(result!.thumbnail).toBeNull();
+	});
+
+	it("returns null id when id is missing from response", async () => {
+		mockRequestUrl.mockResolvedValue({
+			status: 200,
+			json: {
+				results: [
+					{
+						name: "No ID Show",
+						poster_path: "/test.jpg",
+						popularity: 10,
+						vote_count: 5,
+					},
+				],
+			},
+		});
+
+		const result = await fetchTvShowMetadata("no id", API_KEY);
+		expect(result!.id).toBeNull();
 	});
 
 	it("returns null when no results are returned", async () => {

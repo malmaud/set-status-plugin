@@ -22,10 +22,10 @@ describe("fetchBookMetadata", () => {
 		expect(mockRequestUrl).not.toHaveBeenCalled();
 	});
 
-	it("returns thumbnail from cover_i when no language set", async () => {
+	it("returns thumbnail and id from cover_i when no language set", async () => {
 		mockRequestUrl.mockResolvedValue(
 			mockSearchResponse([
-				{ title: "Dune", cover_i: 8227891, ratings_count: 500 },
+				{ key: "/works/OL893415W", title: "Dune", cover_i: 8227891, ratings_count: 500 },
 			])
 		);
 
@@ -34,7 +34,41 @@ describe("fetchBookMetadata", () => {
 		expect(result!.thumbnail).toBe(
 			"https://covers.openlibrary.org/b/id/8227891-M.jpg"
 		);
+		expect(result!.id).toBe("https://openlibrary.org/works/OL893415W");
 		expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns null id when key is missing", async () => {
+		mockRequestUrl.mockResolvedValue(
+			mockSearchResponse([
+				{ title: "No Key Book", cover_i: 1234, ratings_count: 5 },
+			])
+		);
+
+		const result = await fetchBookMetadata("no key book");
+		expect(result!.id).toBeNull();
+	});
+
+	it("returns author from author_name", async () => {
+		mockRequestUrl.mockResolvedValue(
+			mockSearchResponse([
+				{ title: "Dune", cover_i: 123, ratings_count: 500, author_name: ["Frank Herbert"] },
+			])
+		);
+
+		const result = await fetchBookMetadata("dune");
+		expect(result!.author).toBe("Herbert, Frank");
+	});
+
+	it("returns null author when author_name is missing", async () => {
+		mockRequestUrl.mockResolvedValue(
+			mockSearchResponse([
+				{ title: "Anonymous Book", cover_i: 123, ratings_count: 5 },
+			])
+		);
+
+		const result = await fetchBookMetadata("anonymous book");
+		expect(result!.author).toBeNull();
 	});
 
 	it("uses edition cover when language matches", async () => {
@@ -123,17 +157,22 @@ describe("fetchBookMetadata", () => {
 		expect(result!.thumbnail).toContain("4444");
 	});
 
-	it("ranks results by combined popularity", async () => {
+	it("ranks by blending relevance and popularity", async () => {
+		// "Irrelevant Classic" is very popular but returned last by the API (low relevance).
+		// "Relevant Match" is moderately popular and returned first (high relevance).
+		// The blend should favor the relevant match.
 		mockRequestUrl.mockResolvedValue(
 			mockSearchResponse([
-				{ title: "Obscure Book", cover_i: 111, ratings_count: 1 },
-				{ title: "Popular Book", cover_i: 222, ratings_count: 500, want_to_read_count: 1000 },
+				{ title: "Relevant Match", cover_i: 111, ratings_count: 50 },
+				{ title: "Filler A", cover_i: 112, ratings_count: 10 },
+				{ title: "Filler B", cover_i: 113, ratings_count: 5 },
+				{ title: "Filler C", cover_i: 114, ratings_count: 3 },
+				{ title: "Irrelevant Classic", cover_i: 222, ratings_count: 50000 },
 			])
 		);
 
-		const result = await fetchBookMetadata("book");
-		expect(result!.canonicalName).toBe("Popular Book");
-		expect(result!.thumbnail).toContain("222");
+		const result = await fetchBookMetadata("relevant match");
+		expect(result!.canonicalName).toBe("Relevant Match");
 	});
 
 	it("returns null thumbnail when no cover info exists", async () => {
@@ -207,20 +246,23 @@ describe("searchBooks", () => {
 		expect(await searchBooks("")).toEqual([]);
 	});
 
-	it("returns multiple ranked results", async () => {
+	it("returns multiple results blending relevance and popularity", async () => {
+		// API returns in relevance order; ranking blends position with popularity.
+		// The most relevant result (index 0) with decent popularity should stay on top
+		// even if a later result has higher raw popularity.
 		mockRequestUrl.mockResolvedValue(
 			mockSearchResponse([
-				{ title: "Obscure Book", cover_i: 111, ratings_count: 1 },
-				{ title: "Popular Book", cover_i: 222, ratings_count: 500 },
-				{ title: "Mid Book", cover_i: 333, ratings_count: 50 },
+				{ title: "Best Match", cover_i: 111, ratings_count: 100 },
+				{ title: "Also Relevant", cover_i: 222, ratings_count: 80 },
+				{ title: "Tangential", cover_i: 333, ratings_count: 50 },
 			])
 		);
 
 		const results = await searchBooks("book");
 		expect(results).toHaveLength(3);
-		expect(results[0].canonicalName).toBe("Popular Book");
-		expect(results[1].canonicalName).toBe("Mid Book");
-		expect(results[2].canonicalName).toBe("Obscure Book");
+		expect(results[0].canonicalName).toBe("Best Match");
+		expect(results[1].canonicalName).toBe("Also Relevant");
+		expect(results[2].canonicalName).toBe("Tangential");
 	});
 
 	it("uses edition covers when available and language matches", async () => {

@@ -8,6 +8,7 @@ export interface IgdbConfig {
 }
 
 interface IgdbGame {
+	url?: string | null;
 	cover?: {
 		image_id?: string | null;
 	} | null;
@@ -69,6 +70,7 @@ export async function requestIgdbAccessToken(
 }
 
 export interface GameMetadata {
+	id: string | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
 }
@@ -90,7 +92,7 @@ export async function searchGames(
 	}
 
 	const body =
-		`search "${searchTerm}"; fields name,cover.image_id,total_rating_count,rating_count; limit 10;`;
+		`search "${searchTerm}"; fields url,name,cover.image_id,total_rating_count,rating_count; limit 10;`;
 
 	for (let attempt = 1; attempt <= IGDB_MAX_RETRIES; attempt++) {
 		try {
@@ -149,7 +151,7 @@ export async function fetchGameMetadata(
 	}
 
 	const body =
-		`search "${searchTerm}"; fields name,cover.image_id,total_rating_count,rating_count; limit 5;`;
+		`search "${searchTerm}"; fields url,name,cover.image_id,total_rating_count,rating_count; limit 5;`;
 
 	for (let attempt = 1; attempt <= IGDB_MAX_RETRIES; attempt++) {
 		try {
@@ -259,7 +261,8 @@ function gameToMetadata(game: IgdbGame): GameMetadata {
 		imageId && typeof imageId === "string"
 			? `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`
 			: null;
-	return { thumbnail, canonicalName };
+	const id = typeof game.url === "string" ? game.url : null;
+	return { id, thumbnail, canonicalName };
 }
 
 function normalizeCountValue(value: number | null | undefined): number {

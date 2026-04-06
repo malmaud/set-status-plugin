@@ -8,11 +8,13 @@ const TMDB_MAX_RETRIES = 3;
 const TMDB_BASE_BACKOFF_MS = 1000;
 
 export interface TvShowMetadata {
+	id: string | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
 }
 
 interface TmdbTvResult {
+	id?: number | null;
 	name?: string | null;
 	poster_path?: string | null;
 	popularity?: number | null;
@@ -170,7 +172,8 @@ function showToMetadata(show: TmdbTvResult): TvShowMetadata {
 			? `${TMDB_IMAGE_BASE_URL}${TMDB_POSTER_SIZE}${show.poster_path}`
 			: null;
 	const canonicalName = typeof show.name === "string" ? show.name : null;
-	return { thumbnail, canonicalName };
+	const id = typeof show.id === "number" ? `https://www.themoviedb.org/tv/${show.id}` : null;
+	return { id, thumbnail, canonicalName };
 }
 
 function safeNum(value: number | null | undefined): number {

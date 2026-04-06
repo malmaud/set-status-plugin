@@ -271,6 +271,12 @@ export default class MyPlugin extends Plugin {
 		if (thumbnail) {
 			frontmatter.push(`thumbnail: ${thumbnail}`);
 		}
+		if (itemMetadata?.id) {
+			frontmatter.push(`url: ${itemMetadata.id}`);
+		}
+		if (itemMetadata?.author) {
+			frontmatter.push(`author: ${itemMetadata.author}`);
+		}
 		frontmatter.push("---");
 		const bodyLines = [""];
 		if (thumbnail) {
@@ -301,7 +307,7 @@ export default class MyPlugin extends Plugin {
 	private async searchForFolder(
 		itemName: string,
 		folder: string
-	): Promise<{ thumbnail: string | null; canonicalName: string | null }[]> {
+	): Promise<{ id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null }[]> {
 		console.info(`[Set Status Plugin] searchForFolder: "${itemName}" in "${folder}"`);
 		if (folder === GAMES_FOLDER) {
 			const accessToken = await this.ensureIgdbAccessToken();
@@ -332,7 +338,7 @@ export default class MyPlugin extends Plugin {
 
 	private applyThumbnail(
 		file: TFile,
-		choice: { thumbnail: string | null; canonicalName: string | null }
+		choice: { id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null }
 	): void {
 		if (!choice.thumbnail) {
 			new Notice("Selected result has no cover image.");
@@ -342,6 +348,12 @@ export default class MyPlugin extends Plugin {
 		vault.read(file).then((raw) => {
 			const data = extractFrontmatter(raw);
 			data.frontmatter["thumbnail"] = choice.thumbnail;
+			if (choice.id) {
+				data.frontmatter["url"] = choice.id;
+			}
+			if (choice.author) {
+				data.frontmatter["author"] = choice.author;
+			}
 			const { text: updatedContent } = this.upsertCoverImage(
 				data.content,
 				choice.thumbnail!
@@ -475,7 +487,7 @@ export default class MyPlugin extends Plugin {
 	private async fetchMetadataForFolder(
 		itemName: string,
 		folder: string
-	): Promise<{ thumbnail: string | null; canonicalName: string | null } | null> {
+	): Promise<{ id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null } | null> {
 		if (folder === GAMES_FOLDER) {
 			const accessToken = await this.ensureIgdbAccessToken();
 			if (!accessToken) return null;
@@ -526,6 +538,12 @@ export default class MyPlugin extends Plugin {
 			return { status: "unchanged", reason: "Note already references the current thumbnail." };
 		}
 		data.frontmatter["thumbnail"] = nextThumbnail;
+		if (metadata.id) {
+			data.frontmatter["url"] = metadata.id;
+		}
+		if (metadata.author) {
+			data.frontmatter["author"] = metadata.author;
+		}
 		data.content = updatedContent;
 		const markdown = convertToMarkdown(data);
 		await vault.modify(file, markdown);
@@ -832,8 +850,10 @@ class ItemModal extends Modal {
 }
 
 interface ThumbnailChoice {
+	id: string | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
+	author?: string | null;
 }
 
 class ThumbnailPickerModal extends Modal {
