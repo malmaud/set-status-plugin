@@ -40,7 +40,8 @@ export async function correctTitle(
 	title: string,
 	mediaType: string,
 	apiKey: string,
-	model: string
+	model: string,
+	useWebSearch = false
 ): Promise<string | null> {
 	if (!apiKey) {
 		return null;
@@ -56,18 +57,20 @@ export async function correctTitle(
 			},
 			body: JSON.stringify({
 				model,
-				max_tokens: 1024,
-				tools: [
-					{
-						type: "web_search_20250305",
-						name: "web_search",
-						max_uses: 3,
-					},
-				],
+				max_tokens: useWebSearch ? 1024 : 100,
+				...(useWebSearch && {
+					tools: [
+						{
+							type: "web_search_20250305",
+							name: "web_search",
+							max_uses: 3,
+						},
+					],
+				}),
 				messages: [
 					{
 						role: "user",
-						content: `The user typed "${title}" as the title of a ${mediaType} they want to look up. This might contain typos, misspellings, abbreviations, or shorthand. Search the web to identify the most likely real ${mediaType} title this refers to. Respond with ONLY the corrected/expanded title. If you can't confidently identify it, respond with ONLY the original title. Do not add quotes or explanation.`,
+						content: `The user typed "${title}" as the title of a ${mediaType} they want to look up. This might contain typos, misspellings, abbreviations, or shorthand.${useWebSearch ? " Search the web to identify" : " Try to identify"} the most likely real ${mediaType} title this refers to. Respond with ONLY the corrected/expanded title. If you can't confidently identify it, respond with ONLY the original title. Do not add quotes or explanation.`,
 					},
 				],
 			}),
@@ -109,7 +112,8 @@ export async function rerankResults<T extends { canonicalName: string | null }>(
 	query: string,
 	results: T[],
 	apiKey: string,
-	model: string
+	model: string,
+	useWebSearch = false
 ): Promise<T[]> {
 	if (!apiKey || results.length <= 1) {
 		return results;
@@ -130,18 +134,20 @@ export async function rerankResults<T extends { canonicalName: string | null }>(
 			},
 			body: JSON.stringify({
 				model,
-				max_tokens: 1024,
-				tools: [
-					{
-						type: "web_search_20250305",
-						name: "web_search",
-						max_uses: 3,
-					},
-				],
+				max_tokens: useWebSearch ? 1024 : 200,
+				...(useWebSearch && {
+					tools: [
+						{
+							type: "web_search_20250305",
+							name: "web_search",
+							max_uses: 3,
+						},
+					],
+				}),
 				messages: [
 					{
 						role: "user",
-						content: `I searched for "${query}" and got these results:\n${numbered}\n\nIf you're not sure which result best matches my query, search the web to find out. Return ONLY a JSON array of the 0-based indices reordered by best match to my query. Example: [2,0,1,3]`,
+						content: `I searched for "${query}" and got these results:\n${numbered}\n\n${useWebSearch ? "If you're not sure which result best matches my query, search the web to find out. " : ""}Return ONLY a JSON array of the 0-based indices reordered by best match to my query. Example: [2,0,1,3]`,
 					},
 				],
 			}),

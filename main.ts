@@ -35,6 +35,7 @@ interface Settings {
 	bookLanguage: string;
 	claudeApiKey: string;
 	claudeModel: string;
+	claudeWebSearch: boolean;
 }
 
 type ThumbnailUpdateStatus = "updated" | "unchanged" | "skipped";
@@ -45,7 +46,7 @@ interface ThumbnailUpdateResult {
 }
 
 const DEFAULT_SETTINGS: Settings = {
-	statusNames: ["complete", "abandoned", "backlog", "on radar", "in progress"],
+	statusNames: ["complete", "abandoned", "backlog", "on radar", "active", "endless"],
 	dateFormat: "yyyy-MM-dd",
 	igdbClientId: "",
 	igdbClientSecret: "",
@@ -53,6 +54,7 @@ const DEFAULT_SETTINGS: Settings = {
 	bookLanguage: "eng",
 	claudeApiKey: "",
 	claudeModel: "claude-haiku-4-5-20251001",
+	claudeWebSearch: false,
 };
 
 const ITEM_TYPES: ItemType[] = [
@@ -347,7 +349,7 @@ export default class MyPlugin extends Plugin {
 			if (results.length === 0 && !isRetry) {
 				new Notice("No results — asking Claude to identify the title...");
 				const mediaType = ITEM_TYPES.find((t) => t.folder === folder)?.label ?? "media";
-				const corrected = await correctTitle(itemName, mediaType, this.settings.claudeApiKey, this.settings.claudeModel);
+				const corrected = await correctTitle(itemName, mediaType, this.settings.claudeApiKey, this.settings.claudeModel, true);
 				if (corrected && corrected.toLowerCase() !== itemName.toLowerCase()) {
 					new Notice(`Searching for "${corrected}"...`);
 					console.info(`[Set Status Plugin] searchForFolder: retrying with corrected title "${corrected}"`);
@@ -355,7 +357,7 @@ export default class MyPlugin extends Plugin {
 				}
 			} else if (results.length > 1) {
 				new Notice("Ranking results with Claude...");
-				results = await rerankResults(itemName, results, this.settings.claudeApiKey, this.settings.claudeModel);
+				results = await rerankResults(itemName, results, this.settings.claudeApiKey, this.settings.claudeModel, true);
 			}
 		}
 
@@ -545,7 +547,7 @@ export default class MyPlugin extends Plugin {
 			if (result) return result;
 
 			if (this.settings.claudeApiKey) {
-				const corrected = await correctTitle(itemName, "TV Show", this.settings.claudeApiKey, this.settings.claudeModel);
+				const corrected = await correctTitle(itemName, "TV Show", this.settings.claudeApiKey, this.settings.claudeModel, true);
 				if (corrected && corrected.toLowerCase() !== itemName.toLowerCase()) {
 					console.info(`[Set Status Plugin] fetchMetadataForFolder: retrying with corrected title "${corrected}"`);
 					return fetchTvShowMetadata(corrected, this.settings.tmdbApiKey);
@@ -1319,6 +1321,18 @@ class SettingsTab extends PluginSettingTab {
 						new Notice(`Claude API key test failed: ${result.error ?? "Unknown error"}`);
 					}
 				});
+			});
+
+		new Setting(containerEl)
+			.setName("Enable web search for reranking")
+			.setDesc("Allow Claude to search the web when reranking results. More accurate, but costs ~$0.01 per search on top of token costs. Web search is always used for title correction.")
+			.addToggle((toggle) => {
+				toggle
+					.setValue(this.plugin.settings.claudeWebSearch)
+					.onChange(async (value) => {
+						this.plugin.settings.claudeWebSearch = value;
+						await this.plugin.saveSettings();
+					});
 			});
 	}
 }

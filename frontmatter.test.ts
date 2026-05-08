@@ -26,9 +26,9 @@ describe("extractFrontmatter", () => {
 	});
 
 	it("handles empty content after frontmatter", () => {
-		const md = "---\nstatus: in progress\n---\n";
+		const md = "---\nstatus: active\n---\n";
 		const result = extractFrontmatter(md);
-		expect(result.frontmatter["status"]).toBe("in progress");
+		expect(result.frontmatter["status"]).toBe("active");
 		expect(result.content).toBe("");
 	});
 });
