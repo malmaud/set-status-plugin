@@ -1,6 +1,7 @@
 import {
 	App,
 	FuzzySuggestModal,
+	MarkdownView,
 	Modal,
 	Notice,
 	Plugin,
@@ -26,6 +27,19 @@ interface ItemType {
 	folder: string;
 }
 
+interface ItemMetadata {
+	id: string | null;
+	thumbnail: string | null;
+	canonicalName: string | null;
+	author?: string | null;
+}
+
+interface ItemMatch {
+	itemType: ItemType;
+	metadata: ItemMetadata;
+	score: number;
+}
+
 interface Settings {
 	statusNames: string[];
 	dateFormat: string;
@@ -46,7 +60,7 @@ interface ThumbnailUpdateResult {
 }
 
 const DEFAULT_SETTINGS: Settings = {
-	statusNames: ["complete", "abandoned", "backlog", "on radar", "active", "endless"],
+	statusNames: ["active", "on radar", "backlog", "complete", "abandoned", "endless"],
 	dateFormat: "yyyy-MM-dd",
 	igdbClientId: "",
 	igdbClientSecret: "",
@@ -57,9 +71,11 @@ const DEFAULT_SETTINGS: Settings = {
 	claudeWebSearch: false,
 };
 
+const PREFERRED_STATUS_ORDER = ["active", "on radar", "backlog"];
+
 const ITEM_TYPES: ItemType[] = [
 	{ label: "Game", folder: "games" },
-	{ label: "TV Show", folder: "tv shows" },
+	{ label: "Movie / TV Show", folder: "tv shows" },
 	{ label: "Book", folder: "books" },
 ];
 
@@ -72,10 +88,23 @@ const BOOKS_FOLDER = ITEM_TYPES.find(
 )	?.folder ?? "books";
 
 const TV_SHOWS_FOLDER = ITEM_TYPES.find(
-	(item) => item.label.toLowerCase() === "tv show"
+	(item) => item.folder.toLowerCase() === "tv shows"
 )	?.folder ?? "tv shows";
 
 const GAME_STATUSES_WITHOUT_DATE = new Set(["complete", "abandoned"]);
+
+function orderStatusesForPicking(statuses: string[]): string[] {
+	return [...statuses].sort((a, b) => {
+		const aIndex = PREFERRED_STATUS_ORDER.indexOf(a.toLowerCase());
+		const bIndex = PREFERRED_STATUS_ORDER.indexOf(b.toLowerCase());
+		const aRank = aIndex === -1 ? Number.MAX_SAFE_INTEGER : aIndex;
+		const bRank = bIndex === -1 ? Number.MAX_SAFE_INTEGER : bIndex;
+		if (aRank !== bRank) {
+			return aRank - bRank;
+		}
+		return statuses.indexOf(a) - statuses.indexOf(b);
+	});
+}
 
 export default class MyPlugin extends Plugin {
 	settings!: Settings;
@@ -190,7 +219,7 @@ export default class MyPlugin extends Plugin {
 	}
 
 	openStatusChangeModal() {
-		const statusChoices = this.settings.statusNames.map((name) => {
+		const statusChoices = orderStatusesForPicking(this.settings.statusNames).map((name) => {
 			return { name };
 		});
 		new ChoiceModal(
@@ -201,26 +230,23 @@ export default class MyPlugin extends Plugin {
 	}
 
 	newItemCommand() {
-		const statusOptions = this.settings.statusNames;
+		const statusOptions = orderStatusesForPicking(this.settings.statusNames);
 		new ItemModal(
 			this.app,
 			statusOptions,
-			ITEM_TYPES,
 			this.createItemFile.bind(this)
 		).open();
 }
 
 	async createItemFile(
 		itemName: string,
-		status: string,
-		itemType: ItemType
+		status: string
 	): Promise<void> {
 		const vault = this.app.vault;
 		const trimmedName = itemName.trim();
-		const folderPath = itemType.folder;
 
 		if (!trimmedName) {
-			new Notice(`${itemType.label} name cannot be empty`);
+			new Notice("Item name cannot be empty");
 			return;
 		}
 
@@ -230,6 +256,16 @@ export default class MyPlugin extends Plugin {
 			return;
 		}
 
+		const searchNotice = new Notice(`Finding best match for "${trimmedName}"...`, 0);
+		const match = await this.findBestItemMatch(trimmedName);
+		searchNotice.hide();
+		if (!match) {
+			new Notice(`No match found for "${trimmedName}" in configured media sources.`);
+			return;
+		}
+
+		const { itemType, metadata: itemMetadata } = match;
+		const folderPath = itemType.folder;
 		const folder = vault.getAbstractFileByPath(folderPath);
 		if (!folder) {
 			await vault.createFolder(folderPath);
@@ -240,7 +276,6 @@ export default class MyPlugin extends Plugin {
 
 		let displayName = trimmedName;
 		let thumbnail: string | null = null;
-		const itemMetadata = await this.fetchMetadataForFolder(trimmedName, itemType.folder);
 		if (itemMetadata) {
 			if (itemMetadata.canonicalName) {
 				const canonical = itemMetadata.canonicalName.trim();
@@ -285,7 +320,7 @@ export default class MyPlugin extends Plugin {
 			frontmatter.push(`author: ${itemMetadata.author}`);
 		}
 		frontmatter.push("---");
-		const bodyLines = [""];
+		const bodyLines: string[] = [];
 		if (thumbnail) {
 			bodyLines.push(`![Cover Image](${thumbnail})`);
 		}
@@ -297,8 +332,123 @@ export default class MyPlugin extends Plugin {
 			this.app.workspace.getLeaf(false) ?? this.app.workspace.getLeaf(true);
 		if (leaf) {
 			await leaf.openFile(createdFile);
+			const view = leaf.view;
+			if (view instanceof MarkdownView) {
+				const cursorLine = thumbnail
+					? frontmatter.length + 1
+					: frontmatter.length;
+				view.editor.setCursor({ line: cursorLine, ch: 0 });
+				view.editor.focus();
+			}
 		}
 		new Notice(`Created ${filePath}`);
+	}
+
+	private async findBestItemMatch(itemName: string): Promise<ItemMatch | null> {
+		const attempts = await Promise.all(
+			ITEM_TYPES.map(async (itemType) => {
+				try {
+					const metadata = await this.fetchMetadataForFolder(itemName, itemType.folder);
+					if (!metadata) {
+						return null;
+					}
+					return {
+						itemType,
+						metadata,
+						score: this.scoreItemMatch(itemName, metadata),
+					};
+				} catch (error) {
+					console.warn(
+						`[Set Status Plugin] Failed to search ${itemType.label} for "${itemName}"`,
+						error
+					);
+					return null;
+				}
+			})
+		);
+		let matches = attempts.filter((match): match is ItemMatch => match !== null);
+		if (matches.length === 0) {
+			return null;
+		}
+
+		matches.sort((a, b) => {
+			if (b.score !== a.score) {
+				return b.score - a.score;
+			}
+			return ITEM_TYPES.indexOf(a.itemType) - ITEM_TYPES.indexOf(b.itemType);
+		});
+
+		if (this.settings.claudeApiKey && matches.length > 1) {
+			const ranked = await rerankResults(
+				itemName,
+				matches.map((match) => ({
+					...match,
+					canonicalName: this.describeItemMatch(match),
+				})),
+				this.settings.claudeApiKey,
+				this.settings.claudeModel,
+				true
+			);
+			matches = ranked.map((match) => ({
+				itemType: match.itemType,
+				metadata: match.metadata,
+				score: match.score,
+			}));
+		}
+
+		const best = matches[0];
+		console.info(
+			`[Set Status Plugin] Best match for "${itemName}" is ${best.itemType.label}: ` +
+			`"${best.metadata.canonicalName ?? "Unknown"}" (score ${best.score.toFixed(2)})`
+		);
+		return best;
+	}
+
+	private scoreItemMatch(itemName: string, metadata: ItemMetadata): number {
+		const query = this.normalizeMatchText(itemName);
+		const candidate = this.normalizeMatchText(metadata.canonicalName ?? "");
+		let score = 10;
+		if (query && candidate) {
+			if (query === candidate) {
+				score = 100;
+			} else if (candidate.includes(query) || query.includes(candidate)) {
+				const lengthRatio =
+					Math.min(query.length, candidate.length) /
+					Math.max(query.length, candidate.length);
+				score = 70 + lengthRatio * 20;
+			} else {
+				const queryTokens = new Set(query.split(" ").filter(Boolean));
+				const candidateTokens = new Set(candidate.split(" ").filter(Boolean));
+				const shared = [...queryTokens].filter((token) => candidateTokens.has(token)).length;
+				const total = new Set([...queryTokens, ...candidateTokens]).size;
+				score = total > 0 ? 20 + (shared / total) * 50 : score;
+			}
+		}
+		if (metadata.thumbnail) {
+			score += 5;
+		}
+		if (metadata.id) {
+			score += 2;
+		}
+		if (metadata.author) {
+			score += 1;
+		}
+		return score;
+	}
+
+	private normalizeMatchText(value: string): string {
+		return value
+			.toLowerCase()
+			.replace(/^(the|a|an)\s+/, "")
+			.replace(/[^\p{L}\p{N}]+/gu, " ")
+			.replace(/\s+/g, " ")
+			.trim();
+	}
+
+	private describeItemMatch(match: ItemMatch): string {
+		const title = match.metadata.canonicalName ?? "Unknown title";
+		const author = match.metadata.author ? ` by ${match.metadata.author}` : "";
+		return `${title}${author} (${match.itemType.label})`;
 	}
 
 	private detectItemFolder(file: TFile): string | null {
@@ -766,56 +916,30 @@ class ChoiceModal extends FuzzySuggestModal<Status> {
 
 
 class ItemModal extends Modal {
-	onSubmit: (itemName: string, status: string, itemType: ItemType) => Promise<void>;
+	onSubmit: (itemName: string, status: string) => Promise<void>;
 	private readonly statuses: string[];
-	private readonly itemTypes: ItemType[];
 	private itemName = "";
 	private selectedStatus: string;
 	private statusInput: TextComponent | null = null;
-	private selectedItemType: ItemType;
 
 	constructor(
 		app: App,
 		statuses: string[],
-		itemTypes: ItemType[],
-		onSubmit: (itemName: string, status: string, itemType: ItemType) => Promise<void>
+		onSubmit: (itemName: string, status: string) => Promise<void>
 	) {
 		super(app);
 		this.statuses = statuses;
-		this.itemTypes = itemTypes;
 		this.onSubmit = onSubmit;
 		const defaultStatus = statuses.find(
 			(status) => status.toLowerCase() === "on radar"
 		);
 		this.selectedStatus = defaultStatus ?? statuses[0] ?? "on radar";
-		this.selectedItemType = itemTypes[0] ?? { label: "Item", folder: "" };
 	}
 
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.createEl("h2", { text: "New item" });
-
-		new Setting(contentEl)
-			.setName("Type")
-			.addDropdown((dropdown) => {
-				if (this.itemTypes.length === 0) {
-					dropdown.addOption("", "No item types configured");
-					dropdown.setDisabled(true);
-					this.selectedItemType = { label: "Item", folder: "" };
-					return;
-				}
-				this.itemTypes.forEach((type) => {
-					dropdown.addOption(type.folder, type.label);
-				});
-				dropdown.setValue(this.selectedItemType.folder);
-				dropdown.onChange((value) => {
-					const match = this.itemTypes.find((type) => type.folder === value);
-					if (match) {
-						this.selectedItemType = match;
-					}
-				});
-			});
 
 		new Setting(contentEl)
 			.setName("Item name")
@@ -849,14 +973,14 @@ class ItemModal extends Modal {
 			text.inputEl.addEventListener("keydown", (event) => {
 				if (event.key === "ArrowDown") {
 					event.preventDefault();
-					this.openStatusSuggest();
+					this.openStatusSuggest(this.statusInput?.getValue() ?? "");
 				}
 			});
 		});
 		statusSetting.addExtraButton((button) => {
 			button.setIcon("search");
 			button.setTooltip("Browse statuses");
-			button.onClick(() => this.openStatusSuggest());
+			button.onClick(() => this.openStatusSuggest(""));
 		});
 
 		new Setting(contentEl)
@@ -874,19 +998,14 @@ class ItemModal extends Modal {
 			new Notice("Item name cannot be empty");
 			return;
 		}
-		if (!this.selectedItemType.folder) {
-			new Notice("Please choose an item type");
-			return;
-		}
 		await this.onSubmit(
 			trimmed,
-			this.selectedStatus ?? "",
-			this.selectedItemType
+			this.selectedStatus ?? ""
 		);
 		this.close();
 	}
 
-	private openStatusSuggest(): void {
+	private openStatusSuggest(query: string): void {
 		if (this.statuses.length === 0) {
 			new Notice("No statuses configured");
 			return;
@@ -899,7 +1018,7 @@ class ItemModal extends Modal {
 				this.statusInput?.setValue(status);
 				this.statusInput?.inputEl.focus();
 			},
-			this.statusInput?.getValue() ?? ""
+			query
 		);
 		modal.open();
 	}
