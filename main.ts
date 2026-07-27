@@ -13,22 +13,30 @@ import {
 } from "obsidian";
 import * as datefns from "date-fns";
 import { extractFrontmatter, convertToMarkdown } from "./frontmatter";
-import { fetchGameMetadata, searchGames, requestIgdbAccessToken } from "./igdb";
-import { fetchBookMetadata, searchBooks } from "./openlibrary";
-import { fetchTvShowMetadata, searchTvShows } from "./tmdb";
+import { upsertCoverImage } from "./cover";
+import { searchGames, fetchGameById, requestIgdbAccessToken } from "./igdb";
+import { searchBooks, fetchBookByKey } from "./openlibrary";
+import { searchTvShows, fetchTvShowById } from "./tmdb";
 import { rerankResults, testClaudeApiKey, correctTitle } from "./rerank";
 
 interface Status {
 	name: string;
 }
 
+type MediaSource = "igdb" | "openlibrary" | "tmdb";
+
 interface ItemType {
 	label: string;
 	folder: string;
+	source: MediaSource;
 }
 
 interface ItemMetadata {
+	/** Human-facing URL for the entity. */
 	id: string | null;
+	/** Provider-native id, used to re-fetch this exact entity later. */
+	sourceId: string | null;
+	source: MediaSource | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
 	author?: string | null;
@@ -38,6 +46,21 @@ interface ItemMatch {
 	itemType: ItemType;
 	metadata: ItemMetadata;
 	score: number;
+	/** Title-only similarity in 0..1, used for the auto-accept gate. */
+	confidence: number;
+}
+
+type MatchResolution =
+	| { type: "match"; match: ItemMatch }
+	| { type: "plain"; itemType: ItemType }
+	| { type: "cancel" };
+
+interface SearchOptions {
+	/** Ask Claude to reorder this provider's results. */
+	rerank?: boolean;
+	/** Ask Claude for a corrected title when the provider returns nothing. */
+	correctOnEmpty?: boolean;
+	isRetry?: boolean;
 }
 
 interface Settings {
@@ -50,6 +73,7 @@ interface Settings {
 	claudeApiKey: string;
 	claudeModel: string;
 	claudeWebSearch: boolean;
+	alwaysConfirmMatch: boolean;
 }
 
 type ThumbnailUpdateStatus = "updated" | "unchanged" | "skipped";
@@ -69,15 +93,26 @@ const DEFAULT_SETTINGS: Settings = {
 	claudeApiKey: "",
 	claudeModel: "claude-haiku-4-5-20251001",
 	claudeWebSearch: false,
+	alwaysConfirmMatch: false,
 };
 
 const PREFERRED_STATUS_ORDER = ["active", "on radar", "backlog"];
 
 const ITEM_TYPES: ItemType[] = [
-	{ label: "Game", folder: "games" },
-	{ label: "Movie / TV Show", folder: "tv shows" },
-	{ label: "Book", folder: "books" },
+	{ label: "Game", folder: "games", source: "igdb" },
+	{ label: "Movie / TV Show", folder: "tv shows", source: "tmdb" },
+	{ label: "Book", folder: "books", source: "openlibrary" },
 ];
+
+/** Candidates kept per provider before the cross-type rerank. */
+const CANDIDATES_PER_SOURCE = 5;
+/** Below this title similarity, always ask the user to confirm. */
+const AUTO_ACCEPT_CONFIDENCE = 0.95;
+/** The runner-up must be at least this far behind to auto-accept. */
+const AUTO_ACCEPT_MARGIN = 0.15;
+
+const FM_SOURCE = "source";
+const FM_SOURCE_ID = "source id";
 
 const GAMES_FOLDER = ITEM_TYPES.find(
 	(item) => item.label.toLowerCase() === "game"
@@ -92,6 +127,18 @@ const TV_SHOWS_FOLDER = ITEM_TYPES.find(
 )	?.folder ?? "tv shows";
 
 const GAME_STATUSES_WITHOUT_DATE = new Set(["complete", "abandoned"]);
+
+function readStringField(
+	frontmatter: Record<string, unknown> | undefined,
+	key: string
+): string | null {
+	const value = frontmatter?.[key];
+	if (typeof value !== "string") {
+		return null;
+	}
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : null;
+}
 
 function orderStatusesForPicking(statuses: string[]): string[] {
 	return [...statuses].sort((a, b) => {
@@ -242,9 +289,7 @@ export default class MyPlugin extends Plugin {
 		itemName: string,
 		status: string
 	): Promise<void> {
-		const vault = this.app.vault;
 		const trimmedName = itemName.trim();
-
 		if (!trimmedName) {
 			new Notice("Item name cannot be empty");
 			return;
@@ -257,14 +302,68 @@ export default class MyPlugin extends Plugin {
 		}
 
 		const searchNotice = new Notice(`Finding best match for "${trimmedName}"...`, 0);
-		const match = await this.findBestItemMatch(trimmedName);
-		searchNotice.hide();
-		if (!match) {
-			new Notice(`No match found for "${trimmedName}" in configured media sources.`);
+		let candidates: ItemMatch[] = [];
+		try {
+			candidates = await this.gatherCandidates(trimmedName);
+		} catch (error) {
+			console.error(`[Set Status Plugin] Match search failed for "${trimmedName}":`, error);
+			new Notice("Search failed. You can still pick manually or create without metadata.");
+		} finally {
+			searchNotice.hide();
+		}
+
+		const best = candidates[0];
+		if (
+			best &&
+			!this.settings.alwaysConfirmMatch &&
+			this.isConfidentMatch(candidates)
+		) {
+			console.info(
+				`[Set Status Plugin] Auto-accepted ${best.itemType.label} match for "${trimmedName}": ` +
+				`"${best.metadata.canonicalName ?? "Unknown"}" (confidence ${best.confidence.toFixed(2)})`
+			);
+			await this.writeItemFile(trimmedName, chosenStatus, best.itemType, best.metadata);
 			return;
 		}
 
-		const { itemType, metadata: itemMetadata } = match;
+		const resolution = await this.confirmMatch(trimmedName, candidates);
+		if (resolution.type === "cancel") {
+			return;
+		}
+		if (resolution.type === "plain") {
+			await this.writeItemFile(trimmedName, chosenStatus, resolution.itemType, null);
+			return;
+		}
+		await this.writeItemFile(
+			trimmedName,
+			chosenStatus,
+			resolution.match.itemType,
+			resolution.match.metadata
+		);
+	}
+
+	private confirmMatch(
+		query: string,
+		candidates: ItemMatch[]
+	): Promise<MatchResolution> {
+		return new Promise((resolve) => {
+			new MatchPickerModal(
+				this.app,
+				query,
+				candidates,
+				(nextQuery) => this.gatherCandidates(nextQuery),
+				resolve
+			).open();
+		});
+	}
+
+	private async writeItemFile(
+		fallbackName: string,
+		chosenStatus: string,
+		itemType: ItemType,
+		metadata: ItemMetadata | null
+	): Promise<void> {
+		const vault = this.app.vault;
 		const folderPath = itemType.folder;
 		const folder = vault.getAbstractFileByPath(folderPath);
 		if (!folder) {
@@ -274,23 +373,15 @@ export default class MyPlugin extends Plugin {
 			return;
 		}
 
-		let displayName = trimmedName;
-		let thumbnail: string | null = null;
-		if (itemMetadata) {
-			if (itemMetadata.canonicalName) {
-				const canonical = itemMetadata.canonicalName.trim();
-				if (canonical.length > 0) {
-					displayName = canonical;
-				}
-			}
-			thumbnail = itemMetadata.thumbnail ?? null;
-		}
+		const canonical = metadata?.canonicalName?.trim();
+		const displayName = canonical && canonical.length > 0 ? canonical : fallbackName;
+		const thumbnail = metadata?.thumbnail ?? null;
 
 		const sanitizeName = (value: string) =>
 			value.trim().replace(/[\\/:<>"|?*]/g, "-");
 		let sanitizedName = sanitizeName(displayName);
 		if (!sanitizedName) {
-			sanitizedName = sanitizeName(trimmedName);
+			sanitizedName = sanitizeName(fallbackName);
 		}
 
 		const filePath = `${folderPath}/${sanitizedName}.md`;
@@ -299,33 +390,38 @@ export default class MyPlugin extends Plugin {
 			return;
 		}
 
-		const frontmatter = ["---", `status: ${chosenStatus}`];
+		const frontmatter: Record<string, unknown> = { status: chosenStatus };
 		const isGame = itemType.folder === GAMES_FOLDER;
 		const shouldOmitStatusDate =
 			isGame && GAME_STATUSES_WITHOUT_DATE.has(chosenStatus.toLowerCase());
 		if (!shouldOmitStatusDate) {
-			const formattedDate = datefns.format(
+			frontmatter["status date"] = datefns.format(
 				new Date(),
 				this.settings.dateFormat
 			);
-			frontmatter.push(`status date: ${formattedDate}`);
 		}
 		if (thumbnail) {
-			frontmatter.push(`thumbnail: ${thumbnail}`);
+			frontmatter["thumbnail"] = thumbnail;
 		}
-		if (itemMetadata?.id) {
-			frontmatter.push(`url: ${itemMetadata.id}`);
+		if (metadata?.id) {
+			frontmatter["url"] = metadata.id;
 		}
-		if (itemMetadata?.author) {
-			frontmatter.push(`author: ${itemMetadata.author}`);
+		if (metadata?.source) {
+			frontmatter[FM_SOURCE] = metadata.source;
 		}
-		frontmatter.push("---");
-		const bodyLines: string[] = [];
-		if (thumbnail) {
-			bodyLines.push(`![Cover Image](${thumbnail})`);
+		if (metadata?.sourceId) {
+			frontmatter[FM_SOURCE_ID] = metadata.sourceId;
 		}
-		bodyLines.push("");
-		const content = [...frontmatter, ...bodyLines].join("\n");
+		if (metadata?.author) {
+			frontmatter["author"] = metadata.author;
+		}
+
+		// Build through the YAML serializer so titles containing ':', '[' or '#'
+		// can't produce broken frontmatter.
+		const content = convertToMarkdown({
+			frontmatter,
+			content: thumbnail ? `![Cover Image](${thumbnail})\n` : "",
+		});
 
 		const createdFile = await vault.create(filePath, content);
 		const leaf =
@@ -334,9 +430,12 @@ export default class MyPlugin extends Plugin {
 			await leaf.openFile(createdFile);
 			const view = leaf.view;
 			if (view instanceof MarkdownView) {
-				const cursorLine = thumbnail
-					? frontmatter.length + 1
-					: frontmatter.length;
+				const lines = content.split("\n");
+				const closingDelimiter = lines.indexOf("---", 1);
+				const cursorLine =
+					closingDelimiter === -1
+						? lines.length - 1
+						: closingDelimiter + (thumbnail ? 3 : 1);
 				view.editor.setCursor({ line: cursorLine, ch: 0 });
 				view.editor.focus();
 			}
@@ -344,31 +443,36 @@ export default class MyPlugin extends Plugin {
 		new Notice(`Created ${filePath}`);
 	}
 
-	private async findBestItemMatch(itemName: string): Promise<ItemMatch | null> {
-		const attempts = await Promise.all(
-			ITEM_TYPES.map(async (itemType) => {
-				try {
-					const metadata = await this.fetchMetadataForFolder(itemName, itemType.folder);
-					if (!metadata) {
-						return null;
-					}
-					return {
-						itemType,
-						metadata,
-						score: this.scoreItemMatch(itemName, metadata),
-					};
-				} catch (error) {
-					console.warn(
-						`[Set Status Plugin] Failed to search ${itemType.label} for "${itemName}"`,
-						error
-					);
-					return null;
-				}
-			})
-		);
-		let matches = attempts.filter((match): match is ItemMatch => match !== null);
+	/**
+	 * Search every provider, keep the best few from each, and rank the merged
+	 * pool once. This is the same pipeline the thumbnail picker uses, so a bad
+	 * top-1 from any single provider no longer decides the match on its own.
+	 */
+	private async gatherCandidates(itemName: string): Promise<ItemMatch[]> {
+		let query = itemName;
+		let matches = await this.searchAllSources(query);
+
+		// Nothing anywhere: ask Claude once for a corrected title, rather than
+		// once per provider for the same question, then retry across all three.
+		if (matches.length === 0 && this.settings.claudeApiKey) {
+			new Notice("No results — asking Claude to identify the title...");
+			const corrected = await correctTitle(
+				itemName,
+				"movie, TV show, book or video game",
+				this.settings.claudeApiKey,
+				this.settings.claudeModel,
+				this.settings.claudeWebSearch
+			);
+			if (corrected && corrected.toLowerCase() !== itemName.toLowerCase()) {
+				new Notice(`Searching for "${corrected}"...`);
+				console.info(`[Set Status Plugin] gatherCandidates: retrying with corrected title "${corrected}"`);
+				query = corrected;
+				matches = await this.searchAllSources(query);
+			}
+		}
+
 		if (matches.length === 0) {
-			return null;
+			return [];
 		}
 
 		matches.sort((a, b) => {
@@ -379,29 +483,98 @@ export default class MyPlugin extends Plugin {
 		});
 
 		if (this.settings.claudeApiKey && matches.length > 1) {
+			new Notice("Ranking results with Claude...");
 			const ranked = await rerankResults(
-				itemName,
+				query,
 				matches.map((match) => ({
 					...match,
 					canonicalName: this.describeItemMatch(match),
 				})),
 				this.settings.claudeApiKey,
 				this.settings.claudeModel,
-				true
+				this.settings.claudeWebSearch
 			);
-			matches = ranked.map((match) => ({
-				itemType: match.itemType,
-				metadata: match.metadata,
-				score: match.score,
+			matches = ranked.map(({ itemType, metadata, score, confidence }) => ({
+				itemType,
+				metadata,
+				score,
+				confidence,
 			}));
 		}
 
 		const best = matches[0];
 		console.info(
-			`[Set Status Plugin] Best match for "${itemName}" is ${best.itemType.label}: ` +
-			`"${best.metadata.canonicalName ?? "Unknown"}" (score ${best.score.toFixed(2)})`
+			`[Set Status Plugin] ${matches.length} candidates for "${query}"; best is ` +
+			`${best.itemType.label}: "${best.metadata.canonicalName ?? "Unknown"}" ` +
+			`(score ${best.score.toFixed(2)}, confidence ${best.confidence.toFixed(2)})`
 		);
-		return best;
+		return matches;
+	}
+
+	/** Query every provider in parallel and keep the top few from each. */
+	private async searchAllSources(itemName: string): Promise<ItemMatch[]> {
+		const perType = await Promise.all(
+			ITEM_TYPES.map(async (itemType): Promise<ItemMatch[]> => {
+				try {
+					// No per-provider rerank or title correction here — the merged
+					// pool is ranked once, and correction is handled by the caller.
+					const results = await this.searchForFolder(
+						itemName,
+						itemType.folder,
+						undefined,
+						{ rerank: false, correctOnEmpty: false }
+					);
+					return results.slice(0, CANDIDATES_PER_SOURCE).map((metadata) => ({
+						itemType,
+						metadata,
+						score: this.scoreItemMatch(itemName, metadata),
+						confidence: this.matchConfidence(itemName, metadata),
+					}));
+				} catch (error) {
+					console.warn(
+						`[Set Status Plugin] Failed to search ${itemType.label} for "${itemName}"`,
+						error
+					);
+					return [];
+				}
+			})
+		);
+		return perType.flat();
+	}
+
+	/**
+	 * Accept without asking only when the top candidate is a near-exact title
+	 * match *and* clearly ahead of the runner-up. Two providers both matching
+	 * exactly (a book and its film adaptation, say) is precisely the case where
+	 * the user should choose.
+	 */
+	private isConfidentMatch(matches: ItemMatch[]): boolean {
+		const best = matches[0];
+		if (!best || best.confidence < AUTO_ACCEPT_CONFIDENCE) {
+			return false;
+		}
+		const runnerUp = matches[1];
+		if (!runnerUp) {
+			return true;
+		}
+		return best.confidence - runnerUp.confidence >= AUTO_ACCEPT_MARGIN;
+	}
+
+	/** Title-only similarity in 0..1, free of the metadata-completeness bonuses in scoreItemMatch. */
+	private matchConfidence(itemName: string, metadata: ItemMetadata): number {
+		const query = this.normalizeMatchText(itemName);
+		const candidate = this.normalizeMatchText(metadata.canonicalName ?? "");
+		if (!query || !candidate) {
+			return 0;
+		}
+		if (query === candidate) {
+			return 1;
+		}
+		const queryTokens = new Set(query.split(" ").filter(Boolean));
+		const candidateTokens = new Set(candidate.split(" ").filter(Boolean));
+		const shared = [...queryTokens].filter((token) => candidateTokens.has(token)).length;
+		const union = new Set([...queryTokens, ...candidateTokens]).size;
+		return union > 0 ? shared / union : 0;
 	}
 
 	private scoreItemMatch(itemName: string, metadata: ItemMetadata): number {
@@ -465,17 +638,24 @@ export default class MyPlugin extends Plugin {
 		itemName: string,
 		folder: string,
 		author?: string,
-		isRetry = false
-	): Promise<{ id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null }[]> {
+		options: SearchOptions = {}
+	): Promise<ItemMetadata[]> {
+		const { rerank = true, correctOnEmpty = true, isRetry = false } = options;
+		const itemType = ITEM_TYPES.find((type) => type.folder === folder);
+		if (!itemType) {
+			console.warn(`[Set Status Plugin] searchForFolder: unknown folder "${folder}"`);
+			return [];
+		}
+
 		console.info(`[Set Status Plugin] searchForFolder: "${itemName}" in "${folder}"${author ? ` (author="${author}")` : ""}`);
-		let results: { id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null }[];
+		let raw: Omit<ItemMetadata, "source">[];
 		if (folder === GAMES_FOLDER) {
 			const accessToken = await this.ensureIgdbAccessToken();
 			if (!accessToken) {
 				console.warn("[Set Status Plugin] searchForFolder: no IGDB access token");
 				return [];
 			}
-			results = await searchGames(itemName, {
+			raw = await searchGames(itemName, {
 				clientId: this.settings.igdbClientId,
 				accessToken,
 			});
@@ -483,65 +663,149 @@ export default class MyPlugin extends Plugin {
 			const lang = this.settings.bookLanguage || undefined;
 			const bookQuery = author ? `${itemName} ${author}` : itemName;
 			console.info(`[Set Status Plugin] searchForFolder: using book language="${lang ?? "any"}"`);
-			results = await searchBooks(bookQuery, lang);
+			raw = await searchBooks(bookQuery, lang);
 		} else if (folder === TV_SHOWS_FOLDER) {
 			if (!this.settings.tmdbApiKey) {
 				console.warn("[Set Status Plugin] searchForFolder: no TMDB API key");
 				return [];
 			}
-			results = await searchTvShows(itemName, this.settings.tmdbApiKey);
+			raw = await searchTvShows(itemName, this.settings.tmdbApiKey);
 		} else {
 			console.warn(`[Set Status Plugin] searchForFolder: unknown folder "${folder}"`);
 			return [];
 		}
 
+		let results: ItemMetadata[] = raw.map((entry) => ({
+			...entry,
+			source: itemType.source,
+		}));
+
 		if (this.settings.claudeApiKey) {
-			if (results.length === 0 && !isRetry) {
+			if (results.length === 0 && correctOnEmpty && !isRetry) {
 				new Notice("No results — asking Claude to identify the title...");
-				const mediaType = ITEM_TYPES.find((t) => t.folder === folder)?.label ?? "media";
-				const corrected = await correctTitle(itemName, mediaType, this.settings.claudeApiKey, this.settings.claudeModel, true);
+				const corrected = await correctTitle(
+					itemName,
+					itemType.label,
+					this.settings.claudeApiKey,
+					this.settings.claudeModel,
+					this.settings.claudeWebSearch
+				);
 				if (corrected && corrected.toLowerCase() !== itemName.toLowerCase()) {
 					new Notice(`Searching for "${corrected}"...`);
 					console.info(`[Set Status Plugin] searchForFolder: retrying with corrected title "${corrected}"`);
-					return this.searchForFolder(corrected, folder, author, true);
+					return this.searchForFolder(corrected, folder, author, {
+						...options,
+						isRetry: true,
+					});
 				}
-			} else if (results.length > 1) {
+			} else if (rerank && results.length > 1) {
 				new Notice("Ranking results with Claude...");
-				results = await rerankResults(itemName, results, this.settings.claudeApiKey, this.settings.claudeModel, true);
+				results = await rerankResults(
+					itemName,
+					results,
+					this.settings.claudeApiKey,
+					this.settings.claudeModel,
+					this.settings.claudeWebSearch
+				);
 			}
 		}
 
 		return results;
 	}
 
-	private applyThumbnail(
+	/**
+	 * Re-fetch the exact entity a note is already pinned to. Returns null when
+	 * the note has no pin, so the caller can fall back to a title search.
+	 */
+	private async fetchPinnedMetadata(
+		frontmatter: Record<string, unknown> | undefined
+	): Promise<ItemMetadata | null> {
+		const source = readStringField(frontmatter, FM_SOURCE);
+		const sourceId = readStringField(frontmatter, FM_SOURCE_ID);
+		if (!source || !sourceId) {
+			return null;
+		}
+
+		const itemType = ITEM_TYPES.find((type) => type.source === source);
+		if (!itemType) {
+			console.warn(`[Set Status Plugin] fetchPinnedMetadata: unknown source "${source}"`);
+			return null;
+		}
+
+		let raw: Omit<ItemMetadata, "source"> | null = null;
+		if (source === "igdb") {
+			const accessToken = await this.ensureIgdbAccessToken();
+			if (!accessToken) {
+				return null;
+			}
+			raw = await fetchGameById(sourceId, {
+				clientId: this.settings.igdbClientId,
+				accessToken,
+			});
+		} else if (source === "openlibrary") {
+			raw = await fetchBookByKey(sourceId, this.settings.bookLanguage || undefined);
+		} else if (source === "tmdb") {
+			if (!this.settings.tmdbApiKey) {
+				return null;
+			}
+			raw = await fetchTvShowById(sourceId, this.settings.tmdbApiKey);
+		}
+
+		if (!raw) {
+			console.warn(`[Set Status Plugin] fetchPinnedMetadata: ${source} lookup failed for "${sourceId}"`);
+			return null;
+		}
+		return { ...raw, source: itemType.source };
+	}
+
+	private async applyThumbnail(
 		file: TFile,
-		choice: { id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null }
-	): void {
+		choice: ItemMetadata
+	): Promise<void> {
 		if (!choice.thumbnail) {
 			new Notice("Selected result has no cover image.");
 			return;
 		}
-		const vault = this.app.vault;
-		vault.read(file).then((raw) => {
+		try {
+			const raw = await this.app.vault.read(file);
 			const data = extractFrontmatter(raw);
-			data.frontmatter["thumbnail"] = choice.thumbnail;
-			if (choice.id) {
-				data.frontmatter["url"] = choice.id;
-			}
-			if (choice.author) {
-				data.frontmatter["author"] = choice.author;
-			}
-			const { text: updatedContent } = this.upsertCoverImage(
+			this.stampMetadata(data.frontmatter, choice);
+			const { text: updatedContent } = upsertCoverImage(
 				data.content,
-				choice.thumbnail!
+				choice.thumbnail
 			);
 			data.content = updatedContent;
-			const markdown = convertToMarkdown(data);
-			vault.modify(file, markdown).then(() => {
-				new Notice("Thumbnail updated.");
-			});
-		});
+			await this.app.vault.modify(file, convertToMarkdown(data));
+			new Notice("Thumbnail updated.");
+		} catch (error) {
+			console.error("[Set Status Plugin] applyThumbnail failed:", error);
+			new Notice("Could not write the thumbnail. Check the console for details.");
+		}
+	}
+
+	/**
+	 * Record which provider entity a note is bound to, so later refreshes fetch
+	 * by id instead of re-guessing from the filename.
+	 */
+	private stampMetadata(
+		frontmatter: Record<string, unknown>,
+		metadata: ItemMetadata
+	): void {
+		if (metadata.thumbnail) {
+			frontmatter["thumbnail"] = metadata.thumbnail;
+		}
+		if (metadata.id) {
+			frontmatter["url"] = metadata.id;
+		}
+		if (metadata.source) {
+			frontmatter[FM_SOURCE] = metadata.source;
+		}
+		if (metadata.sourceId) {
+			frontmatter[FM_SOURCE_ID] = metadata.sourceId;
+		}
+		if (metadata.author) {
+			frontmatter["author"] = metadata.author;
+		}
 	}
 
 	async pickThumbnailCommand(): Promise<void> {
@@ -567,10 +831,7 @@ export default class MyPlugin extends Plugin {
 		if (folder === BOOKS_FOLDER) {
 			const raw = await this.app.vault.read(file);
 			const data = extractFrontmatter(raw);
-			const val = data.frontmatter?.["author"];
-			if (typeof val === "string" && val.trim()) {
-				author = val.trim();
-			}
+			author = readStringField(data.frontmatter, "author") ?? undefined;
 		}
 
 		console.info(`[Set Status Plugin] pickThumbnail: "${itemName}" in "${folder}"`);
@@ -594,7 +855,7 @@ export default class MyPlugin extends Plugin {
 			new ThumbnailPickerModal(
 				this.app,
 				withCovers,
-				(choice) => this.applyThumbnail(file, choice)
+				(choice) => void this.applyThumbnail(file, choice)
 			).open();
 		} catch (error) {
 			searchNotice.hide();
@@ -652,83 +913,44 @@ export default class MyPlugin extends Plugin {
 		return files;
 	}
 
-	private upsertCoverImage(
-		content: string,
-		thumbnail: string
-	): { text: string; changed: boolean } {
-		const coverLine = `![Cover Image](${thumbnail})`;
-		const normalizedOriginal = content.replace(/\r\n/g, "\n");
-		const imageRegex = /!\[[^\]]*]\([^)]+\)/g;
-		const withoutImages = normalizedOriginal.replace(imageRegex, "");
-		const trimmedLeading = withoutImages.replace(/^\n+/, "");
-		const trimmedTrailing = trimmedLeading.replace(/\s+$/, "");
-		let finalContent = coverLine;
-		if (trimmedTrailing.length > 0) {
-			finalContent += `\n\n${trimmedTrailing}`;
-		}
-		finalContent = finalContent.replace(/\n{3,}/g, "\n\n");
-		if (!finalContent.endsWith("\n")) {
-			finalContent += "\n";
-		}
-		const changed = finalContent !== normalizedOriginal;
-		return { text: finalContent, changed };
-	}
-
-	private async fetchMetadataForFolder(
-		itemName: string,
-		folder: string,
-		author?: string
-	): Promise<{ id: string | null; thumbnail: string | null; canonicalName: string | null; author?: string | null } | null> {
-		if (folder === GAMES_FOLDER) {
-			const accessToken = await this.ensureIgdbAccessToken();
-			if (!accessToken) return null;
-			return fetchGameMetadata(itemName, {
-				clientId: this.settings.igdbClientId,
-				accessToken,
-			});
-		}
-		if (folder === BOOKS_FOLDER) {
-			const bookQuery = author ? `${itemName} ${author}` : itemName;
-			return fetchBookMetadata(bookQuery, this.settings.bookLanguage || undefined);
-		}
-		if (folder === TV_SHOWS_FOLDER) {
-			if (!this.settings.tmdbApiKey) return null;
-			const result = await fetchTvShowMetadata(itemName, this.settings.tmdbApiKey);
-			if (result) return result;
-
-			if (this.settings.claudeApiKey) {
-				const corrected = await correctTitle(itemName, "TV Show", this.settings.claudeApiKey, this.settings.claudeModel, true);
-				if (corrected && corrected.toLowerCase() !== itemName.toLowerCase()) {
-					console.info(`[Set Status Plugin] fetchMetadataForFolder: retrying with corrected title "${corrected}"`);
-					return fetchTvShowMetadata(corrected, this.settings.tmdbApiKey);
-				}
-			}
-			return null;
-		}
-		return null;
-	}
-
 	private async updateNoteThumbnail(
 		file: TFile,
-		folder: string
+		folder: string,
+		options: SearchOptions = {}
 	): Promise<ThumbnailUpdateResult> {
 		const vault = this.app.vault;
 		const raw = await vault.read(file);
 		const data = extractFrontmatter(raw);
 		const itemName = file.basename.trim();
-		if (!itemName) {
-			return { status: "skipped", reason: "Could not determine item name from filename." };
-		}
 
-		let existingAuthor: string | undefined;
-		if (folder === BOOKS_FOLDER) {
-			const val = data.frontmatter?.["author"];
-			if (typeof val === "string" && val.trim()) {
-				existingAuthor = val.trim();
+		// A note that already recorded its provider entity is refreshed by id —
+		// never re-searched by title, which is what used to let a refresh drift
+		// onto a different item. If the pinned lookup fails we stop rather than
+		// falling back to a title search, so a transient error can't re-point
+		// the note at something else.
+		const isPinned =
+			readStringField(data.frontmatter, FM_SOURCE) !== null &&
+			readStringField(data.frontmatter, FM_SOURCE_ID) !== null;
+
+		let metadata = isPinned ? await this.fetchPinnedMetadata(data.frontmatter) : null;
+		if (isPinned && !metadata) {
+			return {
+				status: "skipped",
+				reason: `Could not re-fetch the pinned entity for '${itemName}'; leaving the existing match alone.`,
+			};
+		}
+		if (!metadata) {
+			if (!itemName) {
+				return { status: "skipped", reason: "Could not determine item name from filename." };
 			}
+			const existingAuthor =
+				folder === BOOKS_FOLDER
+					? readStringField(data.frontmatter, "author") ?? undefined
+					: undefined;
+			const results = await this.searchForFolder(itemName, folder, existingAuthor, options);
+			metadata = results[0] ?? null;
 		}
 
-		const metadata = await this.fetchMetadataForFolder(itemName, folder, existingAuthor);
 		if (!metadata) {
 			return { status: "skipped", reason: `No result found for '${itemName}'.` };
 		}
@@ -737,26 +959,18 @@ export default class MyPlugin extends Plugin {
 		}
 
 		const nextThumbnail = metadata.thumbnail;
-		const currentThumbnail =
-			typeof data.frontmatter?.["thumbnail"] === "string"
-				? data.frontmatter["thumbnail"].trim()
-				: null;
+		const currentThumbnail = readStringField(data.frontmatter, "thumbnail");
+		const pinChanged =
+			readStringField(data.frontmatter, FM_SOURCE_ID) !== (metadata.sourceId ?? null);
 		const { text: updatedContent, changed: contentChanged } =
-			this.upsertCoverImage(data.content, nextThumbnail);
+			upsertCoverImage(data.content, nextThumbnail);
 		const frontmatterChanged = currentThumbnail !== nextThumbnail;
-		if (!frontmatterChanged && !contentChanged) {
+		if (!frontmatterChanged && !contentChanged && !pinChanged) {
 			return { status: "unchanged", reason: "Note already references the current thumbnail." };
 		}
-		data.frontmatter["thumbnail"] = nextThumbnail;
-		if (metadata.id) {
-			data.frontmatter["url"] = metadata.id;
-		}
-		if (metadata.author) {
-			data.frontmatter["author"] = metadata.author;
-		}
+		this.stampMetadata(data.frontmatter, metadata);
 		data.content = updatedContent;
-		const markdown = convertToMarkdown(data);
-		await vault.modify(file, markdown);
+		await vault.modify(file, convertToMarkdown(data));
 		return { status: "updated" };
 	}
 
@@ -802,7 +1016,13 @@ export default class MyPlugin extends Plugin {
 						continue;
 					}
 
-					const result = await this.updateNoteThumbnail(file, folder);
+					// Bulk pass: no per-file Claude calls. Reranking and title
+					// correction each cost a web search, and this loop can span
+					// the whole vault.
+					const result = await this.updateNoteThumbnail(file, folder, {
+						rerank: false,
+						correctOnEmpty: false,
+					});
 
 					switch (result.status) {
 						case "updated": totalUpdated++; break;
@@ -998,11 +1218,11 @@ class ItemModal extends Modal {
 			new Notice("Item name cannot be empty");
 			return;
 		}
-		await this.onSubmit(
-			trimmed,
-			this.selectedStatus ?? ""
-		);
+		const status = this.selectedStatus ?? "";
+		// Close before searching — creation may open the confirm-match modal,
+		// and stacking it on top of this one looks broken.
 		this.close();
+		await this.onSubmit(trimmed, status);
 	}
 
 	private openStatusSuggest(query: string): void {
@@ -1028,21 +1248,203 @@ class ItemModal extends Modal {
 	}
 }
 
-interface ThumbnailChoice {
-	id: string | null;
-	thumbnail: string | null;
-	canonicalName: string | null;
-	author?: string | null;
-}
-
-class ThumbnailPickerModal extends Modal {
-	private results: ThumbnailChoice[];
-	private onPick: (choice: ThumbnailChoice) => void;
+/**
+ * Shown when the automatic match isn't confident enough to commit to. Lets the
+ * user pick from the ranked candidates, retype the search, or create the note
+ * with no metadata at all so an item the providers don't know about is still
+ * trackable.
+ */
+class MatchPickerModal extends Modal {
+	private query: string;
+	private candidates: ItemMatch[];
+	private readonly search: (query: string) => Promise<ItemMatch[]>;
+	private readonly onResolve: (resolution: MatchResolution) => void;
+	private resolved = false;
+	private searching = false;
+	private resultsEl: HTMLElement | null = null;
+	private queryInput: TextComponent | null = null;
 
 	constructor(
 		app: App,
-		results: ThumbnailChoice[],
-		onPick: (choice: ThumbnailChoice) => void
+		query: string,
+		candidates: ItemMatch[],
+		search: (query: string) => Promise<ItemMatch[]>,
+		onResolve: (resolution: MatchResolution) => void
+	) {
+		super(app);
+		this.query = query;
+		this.candidates = candidates;
+		this.search = search;
+		this.onResolve = onResolve;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h2", { text: "Confirm match" });
+
+		const searchSetting = new Setting(contentEl)
+			.setName("Search for")
+			.setDesc("Edit the title and search again if none of these are right.");
+		searchSetting.addText((text) => {
+			this.queryInput = text;
+			text.setValue(this.query);
+			text.inputEl.addEventListener("keydown", (event) => {
+				if (event.key === "Enter") {
+					event.preventDefault();
+					void this.runSearch();
+				}
+			});
+		});
+		searchSetting.addButton((button) =>
+			button.setButtonText("Search").onClick(() => void this.runSearch())
+		);
+
+		this.resultsEl = contentEl.createDiv();
+		this.renderResults();
+
+		const footer = new Setting(contentEl)
+			.setName("None of these?")
+			.setDesc("Create the note without any metadata, in the folder you choose.");
+		for (const itemType of ITEM_TYPES) {
+			footer.addButton((button) =>
+				button
+					.setButtonText(itemType.label)
+					.onClick(() => this.resolve({ type: "plain", itemType }))
+			);
+		}
+	}
+
+	private async runSearch(): Promise<void> {
+		if (this.searching) {
+			return;
+		}
+		const nextQuery = this.queryInput?.getValue().trim() ?? "";
+		if (!nextQuery) {
+			new Notice("Enter something to search for.");
+			return;
+		}
+		this.searching = true;
+		this.query = nextQuery;
+		this.renderMessage(`Searching for "${nextQuery}"...`);
+		try {
+			this.candidates = await this.search(nextQuery);
+		} catch (error) {
+			console.error("[Set Status Plugin] Match search failed:", error);
+			this.candidates = [];
+		} finally {
+			this.searching = false;
+		}
+		this.renderResults();
+	}
+
+	private renderMessage(text: string): void {
+		if (!this.resultsEl) {
+			return;
+		}
+		this.resultsEl.empty();
+		const message = this.resultsEl.createEl("p", { text });
+		message.style.color = "var(--text-muted)";
+	}
+
+	private renderResults(): void {
+		if (!this.resultsEl) {
+			return;
+		}
+		if (this.candidates.length === 0) {
+			this.renderMessage(
+				`No matches found for "${this.query}". Try a different spelling, or create the note without metadata.`
+			);
+			return;
+		}
+
+		this.resultsEl.empty();
+		const grid = this.resultsEl.createDiv({ cls: "match-picker-grid" });
+		grid.style.display = "grid";
+		grid.style.gridTemplateColumns = "repeat(auto-fill, minmax(150px, 1fr))";
+		grid.style.gap = "12px";
+		grid.style.margin = "12px 0";
+		grid.style.maxHeight = "50vh";
+		grid.style.overflowY = "auto";
+
+		for (const candidate of this.candidates) {
+			const card = grid.createDiv({ cls: "match-picker-card" });
+			card.style.cursor = "pointer";
+			card.style.textAlign = "center";
+			card.style.padding = "8px";
+			card.style.borderRadius = "6px";
+			card.style.border = "1px solid var(--background-modifier-border)";
+
+			if (candidate.metadata.thumbnail) {
+				const img = card.createEl("img", {
+					attr: { src: candidate.metadata.thumbnail },
+				});
+				img.style.width = "100%";
+				img.style.height = "auto";
+				img.style.borderRadius = "4px";
+				img.style.marginBottom = "6px";
+			} else {
+				const placeholder = card.createDiv({ text: "No cover" });
+				placeholder.style.padding = "24px 0";
+				placeholder.style.fontSize = "0.8em";
+				placeholder.style.color = "var(--text-faint)";
+			}
+
+			const title = card.createDiv({
+				text: candidate.metadata.canonicalName ?? "Unknown title",
+			});
+			title.style.fontSize = "0.9em";
+
+			if (candidate.metadata.author) {
+				const author = card.createDiv({ text: candidate.metadata.author });
+				author.style.fontSize = "0.8em";
+				author.style.color = "var(--text-muted)";
+			}
+
+			const badge = card.createDiv({ text: candidate.itemType.label });
+			badge.style.marginTop = "4px";
+			badge.style.fontSize = "0.75em";
+			badge.style.color = "var(--text-faint)";
+
+			card.addEventListener("mouseenter", () => {
+				card.style.border = "1px solid var(--interactive-accent)";
+			});
+			card.addEventListener("mouseleave", () => {
+				card.style.border = "1px solid var(--background-modifier-border)";
+			});
+			card.addEventListener("click", () =>
+				this.resolve({ type: "match", match: candidate })
+			);
+		}
+	}
+
+	private resolve(resolution: MatchResolution): void {
+		if (this.resolved) {
+			return;
+		}
+		this.resolved = true;
+		this.onResolve(resolution);
+		this.close();
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		// Dismissing the modal any other way (Esc, click-out) cancels creation.
+		if (!this.resolved) {
+			this.resolved = true;
+			this.onResolve({ type: "cancel" });
+		}
+	}
+}
+
+class ThumbnailPickerModal extends Modal {
+	private results: ItemMetadata[];
+	private onPick: (choice: ItemMetadata) => void;
+
+	constructor(
+		app: App,
+		results: ItemMetadata[],
+		onPick: (choice: ItemMetadata) => void
 	) {
 		super(app);
 		this.results = results;
@@ -1244,6 +1646,19 @@ class SettingsTab extends PluginSettingTab {
 						text.inputEl.rows = 10;
 					});
 			});
+		new Setting(containerEl)
+			.setName("Always confirm match")
+			.setDesc(
+				"Show the candidate picker every time a new item is created, even when the best match looks certain."
+			)
+			.addToggle((toggle) => {
+				toggle
+					.setValue(this.plugin.settings.alwaysConfirmMatch)
+					.onChange(async (value) => {
+						this.plugin.settings.alwaysConfirmMatch = value;
+						await this.plugin.saveSettings();
+					});
+			});
 		new Setting(containerEl).setName("Date format").addText((text) => {
 			text.setPlaceholder("yyyy-MM-dd")
 				.setValue(this.getDateFormat())
@@ -1345,8 +1760,8 @@ class SettingsTab extends PluginSettingTab {
 						return;
 					}
 					this.setIndicator(tmdbIndicator, "checking");
-					const result = await fetchTvShowMetadata("Breaking Bad", apiKey);
-					if (result) {
+					const result = await searchTvShows("Breaking Bad", apiKey);
+					if (result.length > 0) {
 						this.setIndicator(tmdbIndicator, "valid");
 						new Notice("TMDB API key is valid.");
 					} else {

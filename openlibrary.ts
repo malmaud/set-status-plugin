@@ -15,6 +15,8 @@ const SEARCH_FIELDS = [
 
 export interface BookMetadata {
 	id: string | null;
+	/** Open Library work key, e.g. "/works/OL893415W". Stable across retitling. */
+	sourceId: string | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
 	author: string | null;
@@ -63,50 +65,60 @@ export async function searchBooks(
 	console.info(`${LOG_PREFIX} searchBooks: got ${docs.length} docs from search`);
 	const ranked = rankAllBooks(docs);
 
-	const results: BookMetadata[] = ranked.map((doc) => ({
-		id: typeof doc.key === "string" ? `https://openlibrary.org${doc.key}` : null,
-		thumbnail: resolveCover(doc, language),
-		canonicalName: typeof doc.title === "string" ? doc.title : null,
-		author: resolveAuthor(doc),
-	}));
+	const results = ranked.map((doc) => docToMetadata(doc, language));
 	console.info(`${LOG_PREFIX} searchBooks: returning ${results.length} results (${results.filter(r => r.thumbnail).length} with covers)`);
 	return results;
 }
 
-export async function fetchBookMetadata(
-	bookName: string,
+/**
+ * Look a book up by its Open Library work key rather than by title, so a
+ * confirmed match stays pinned to the same work when the note is refreshed.
+ */
+export async function fetchBookByKey(
+	workKey: string,
 	language?: string
 ): Promise<BookMetadata | null> {
-	const trimmed = bookName.trim();
-	if (!trimmed) {
+	const key = workKey.trim();
+	if (!key) {
 		return null;
 	}
+	console.info(`${LOG_PREFIX} fetchBookByKey: key="${key}"`);
 
-	console.info(`${LOG_PREFIX} fetchBookMetadata: query="${trimmed}", language=${language ?? "any"}`);
-
+	// Quote the key — Solr reads a bare /.../ term as a regex literal.
 	const params = new URLSearchParams({
-		q: trimmed,
+		q: `key:"${key}"`,
 		fields: SEARCH_FIELDS,
-		limit: "5",
+		limit: "1",
 	});
 	if (language) {
 		params.set("language", language);
 	}
 
 	const docs = await searchRequest(params);
-	const ranked = rankAllBooks(docs);
-	if (ranked.length === 0) {
-		console.info(`${LOG_PREFIX} fetchBookMetadata: no results for "${trimmed}"`);
+	if (docs.length === 0) {
+		console.info(`${LOG_PREFIX} fetchBookByKey: no doc for "${key}"`);
 		return null;
 	}
+	return docToMetadata(docs[0], language);
+}
 
-	const doc = ranked[0];
-	const id = typeof doc.key === "string" ? `https://openlibrary.org${doc.key}` : null;
-	const thumbnail = resolveCover(doc, language);
-	const canonicalName = typeof doc.title === "string" ? doc.title : null;
-	const author = resolveAuthor(doc);
-	console.info(`${LOG_PREFIX} fetchBookMetadata: best match "${canonicalName}", thumbnail=${thumbnail ?? "none"}`);
-	return { id, thumbnail, canonicalName, author };
+export async function fetchBookMetadata(
+	bookName: string,
+	language?: string
+): Promise<BookMetadata | null> {
+	const results = await searchBooks(bookName, language);
+	return results.length > 0 ? results[0] : null;
+}
+
+function docToMetadata(doc: OpenLibraryDoc, language?: string): BookMetadata {
+	const key = typeof doc.key === "string" ? doc.key : null;
+	return {
+		id: key ? `https://openlibrary.org${key}` : null,
+		sourceId: key,
+		thumbnail: resolveCover(doc, language),
+		canonicalName: typeof doc.title === "string" ? doc.title : null,
+		author: resolveAuthor(doc),
+	};
 }
 
 async function searchRequest(params: URLSearchParams): Promise<OpenLibraryDoc[]> {

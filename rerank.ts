@@ -134,7 +134,9 @@ export async function rerankResults<T extends { canonicalName: string | null }>(
 			},
 			body: JSON.stringify({
 				model,
-				max_tokens: useWebSearch ? 1024 : 200,
+				// Enough headroom that a long candidate list can't be cut off
+				// mid-array, which would leave the response unparseable.
+				max_tokens: useWebSearch ? 1024 : 512,
 				...(useWebSearch && {
 					tools: [
 						{
@@ -147,7 +149,7 @@ export async function rerankResults<T extends { canonicalName: string | null }>(
 				messages: [
 					{
 						role: "user",
-						content: `I searched for "${query}" and got these results:\n${numbered}\n\n${useWebSearch ? "If you're not sure which result best matches my query, search the web to find out. " : ""}Return ONLY a JSON array of the 0-based indices reordered by best match to my query. Example: [2,0,1,3]`,
+						content: `I searched for "${query}" and got these results:\n${numbered}\n\n${useWebSearch ? "If you're not sure which result best matches my query, search the web to find out. " : ""}Return ONLY a JSON array of the 0-based indices reordered by best match to my query. Listing just the best few is fine if the rest are clearly irrelevant. Example: [2,0,1,3]`,
 					},
 				],
 			}),
@@ -180,24 +182,45 @@ export async function rerankResults<T extends { canonicalName: string | null }>(
 			return results;
 		}
 
-		const valid =
-			indices.length === results.length &&
-			indices.every(
-				(v: unknown) =>
-					typeof v === "number" &&
-					Number.isInteger(v) &&
-					v >= 0 &&
-					v < results.length
-			) &&
-			new Set(indices).size === results.length;
+		const seen = new Set<number>();
+		const ordered: number[] = [];
+		for (const value of indices) {
+			if (
+				typeof value !== "number" ||
+				!Number.isInteger(value) ||
+				value < 0 ||
+				value >= results.length
+			) {
+				console.warn(`${LOG_PREFIX} Out-of-range index: ${JSON.stringify(indices)}`);
+				return results;
+			}
+			if (seen.has(value)) {
+				console.warn(`${LOG_PREFIX} Duplicate index: ${JSON.stringify(indices)}`);
+				return results;
+			}
+			seen.add(value);
+			ordered.push(value);
+		}
 
-		if (!valid) {
-			console.warn(`${LOG_PREFIX} Invalid indices: ${JSON.stringify(indices)}`);
+		if (ordered.length === 0) {
+			console.warn(`${LOG_PREFIX} Empty ranking returned`);
 			return results;
 		}
 
-		console.info(`${LOG_PREFIX} Reranked "${query}": ${JSON.stringify(indices)}`);
-		return (indices as number[]).map((i) => results[i]);
+		// A truncated ranking is still a usable partial order — models routinely
+		// return only the top few. Keep what was ranked, then append everything
+		// unmentioned in the provider's original order.
+		for (let i = 0; i < results.length; i++) {
+			if (!seen.has(i)) {
+				ordered.push(i);
+			}
+		}
+
+		console.info(
+			`${LOG_PREFIX} Reranked "${query}": ${JSON.stringify(indices)}` +
+			(ordered.length > indices.length ? ` (+${ordered.length - indices.length} unranked)` : "")
+		);
+		return ordered.map((i) => results[i]);
 	} catch (error) {
 		console.warn(`${LOG_PREFIX} Reranking failed, using original order`, error);
 		return results;

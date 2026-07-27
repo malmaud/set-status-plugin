@@ -8,6 +8,7 @@ export interface IgdbConfig {
 }
 
 interface IgdbGame {
+	id?: number | null;
 	url?: string | null;
 	cover?: {
 		image_id?: string | null;
@@ -18,6 +19,7 @@ interface IgdbGame {
 }
 
 const IGDB_GAMES_ENDPOINT = "https://api.igdb.com/v4/games";
+const IGDB_FIELDS = "id,url,name,cover.image_id,total_rating_count,rating_count";
 const IGDB_IMAGE_BASE_URL = "https://images.igdb.com/igdb/image/upload/";
 const IGDB_COVER_SIZE = "t_cover_big";
 const IGDB_TOKEN_ENDPOINT = "https://id.twitch.tv/oauth2/token";
@@ -71,8 +73,61 @@ export async function requestIgdbAccessToken(
 
 export interface GameMetadata {
 	id: string | null;
+	/** IGDB's own numeric id, stringified. Stable across title changes. */
+	sourceId: string | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
+}
+
+async function igdbQuery(
+	body: string,
+	config: IgdbConfig
+): Promise<IgdbGame[]> {
+	for (let attempt = 1; attempt <= IGDB_MAX_RETRIES; attempt++) {
+		try {
+			const response = await requestUrl({
+				url: IGDB_GAMES_ENDPOINT,
+				method: "POST",
+				headers: {
+					"Client-ID": config.clientId,
+					Authorization: `Bearer ${config.accessToken}`,
+					Accept: "application/json",
+					"Content-Type": "text/plain",
+				},
+				body,
+				throw: false,
+			});
+
+			if (response.status >= 400) {
+				if (isTooManyRequests(response.status, response.text) && attempt < IGDB_MAX_RETRIES) {
+					const delayMs = IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
+					console.warn(
+						`IGDB rate limited (attempt ${attempt}/${IGDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
+					);
+					await delay(delayMs);
+					continue;
+				}
+				console.error(
+					`IGDB request failed (${response.status}): ${response.text ?? ""}`
+				);
+				return [];
+			}
+
+			return normalizeResponse(response.json, response.text);
+		} catch (error) {
+			if (isTooManyRequests(undefined, undefined, error) && attempt < IGDB_MAX_RETRIES) {
+				const delayMs = IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
+				console.warn(
+					`IGDB rate limited (attempt ${attempt}/${IGDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
+				);
+				await delay(delayMs);
+				continue;
+			}
+			console.error("Failed to query IGDB", error);
+			return [];
+		}
+	}
+	return [];
 }
 
 export async function searchGames(
@@ -91,124 +146,45 @@ export async function searchGames(
 		return [];
 	}
 
-	const body =
-		`search "${searchTerm}"; fields url,name,cover.image_id,total_rating_count,rating_count; limit 10;`;
+	const games = await igdbQuery(
+		`search "${searchTerm}"; fields ${IGDB_FIELDS}; limit 10;`,
+		config
+	);
+	return rankAllGamesByPlayedCount(games).map(gameToMetadata);
+}
 
-	for (let attempt = 1; attempt <= IGDB_MAX_RETRIES; attempt++) {
-		try {
-			const response = await requestUrl({
-				url: IGDB_GAMES_ENDPOINT,
-				method: "POST",
-				headers: {
-					"Client-ID": config.clientId,
-					Authorization: `Bearer ${config.accessToken}`,
-					Accept: "application/json",
-					"Content-Type": "text/plain",
-				},
-				body,
-				throw: false,
-			});
-
-			if (response.status >= 400) {
-				if (isTooManyRequests(response.status, response.text) && attempt < IGDB_MAX_RETRIES) {
-					await delay(IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
-					continue;
-				}
-				return [];
-			}
-
-			const games = normalizeResponse(response.json, response.text);
-			return rankAllGamesByPlayedCount(games).map(gameToMetadata);
-		} catch (error) {
-			if (isTooManyRequests(undefined, undefined, error) && attempt < IGDB_MAX_RETRIES) {
-				await delay(IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
-				continue;
-			}
-			console.error("Failed to search IGDB", error);
-			return [];
-		}
+/**
+ * Look a game up by IGDB's own id rather than by title. Used to refresh a note
+ * whose match was already confirmed, so a renamed file can't silently re-point
+ * the note at a different game.
+ */
+export async function fetchGameById(
+	sourceId: string,
+	config: IgdbConfig
+): Promise<GameMetadata | null> {
+	const numericId = Number(sourceId);
+	if (!Number.isInteger(numericId) || numericId <= 0) {
+		console.warn(`${LOG_PREFIX} fetchGameById: invalid id "${sourceId}"`);
+		return null;
 	}
-	return [];
+	if (!config.clientId || !config.accessToken) {
+		return null;
+	}
+	console.info(`${LOG_PREFIX} fetchGameById: id=${numericId}`);
+
+	const games = await igdbQuery(
+		`fields ${IGDB_FIELDS}; where id = ${numericId}; limit 1;`,
+		config
+	);
+	return games.length > 0 ? gameToMetadata(games[0]) : null;
 }
 
 export async function fetchGameMetadata(
 	gameName: string,
 	config: IgdbConfig
 ): Promise<GameMetadata | null> {
-	const trimmed = gameName.trim();
-	if (!trimmed) {
-		return null;
-	}
-	if (!config.clientId || !config.accessToken) {
-		console.info(`${LOG_PREFIX} fetchGameMetadata: skipped (missing credentials)`);
-		return null;
-	}
-	console.info(`${LOG_PREFIX} fetchGameMetadata: query="${trimmed}"`);
-
-	const searchTerm = sanitizeQuery(trimmed);
-	if (!searchTerm) {
-		return null;
-	}
-
-	const body =
-		`search "${searchTerm}"; fields url,name,cover.image_id,total_rating_count,rating_count; limit 5;`;
-
-	for (let attempt = 1; attempt <= IGDB_MAX_RETRIES; attempt++) {
-		try {
-			const response = await requestUrl({
-				url: IGDB_GAMES_ENDPOINT,
-				method: "POST",
-				headers: {
-					"Client-ID": config.clientId,
-					Authorization: `Bearer ${config.accessToken}`,
-					Accept: "application/json",
-					"Content-Type": "text/plain",
-				},
-				body,
-				throw: false,
-			});
-
-			if (response.status >= 400) {
-				const tooManyRequests = isTooManyRequests(
-					response.status,
-					response.text
-				);
-				if (tooManyRequests && attempt < IGDB_MAX_RETRIES) {
-					const delayMs = IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
-					console.warn(
-						`IGDB rate limited (attempt ${attempt}/${IGDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
-					);
-					await delay(delayMs);
-					continue;
-				}
-				console.error(
-					`IGDB request failed (${response.status}): ${response.text ?? ""}`
-				);
-				return null;
-			}
-
-			const games = normalizeResponse(response.json, response.text);
-			const ranked = rankAllGamesByPlayedCount(games);
-			if (ranked.length === 0) {
-				return null;
-			}
-
-			return gameToMetadata(ranked[0]);
-		} catch (error) {
-			const tooManyRequests = isTooManyRequests(undefined, undefined, error);
-			if (tooManyRequests && attempt < IGDB_MAX_RETRIES) {
-				const delayMs = IGDB_BASE_BACKOFF_MS * 2 ** (attempt - 1);
-				console.warn(
-					`IGDB rate limited (attempt ${attempt}/${IGDB_MAX_RETRIES}). Retrying in ${delayMs}ms.`
-				);
-				await delay(delayMs);
-				continue;
-			}
-			console.error("Failed to fetch IGDB metadata", error);
-			return null;
-		}
-	}
-	return null;
+	const results = await searchGames(gameName, config);
+	return results.length > 0 ? results[0] : null;
 }
 
 function sanitizeQuery(value: string): string {
@@ -262,7 +238,8 @@ function gameToMetadata(game: IgdbGame): GameMetadata {
 			? `${IGDB_IMAGE_BASE_URL}${IGDB_COVER_SIZE}/${imageId}.jpg`
 			: null;
 	const id = typeof game.url === "string" ? game.url : null;
-	return { id, thumbnail, canonicalName };
+	const sourceId = typeof game.id === "number" ? String(game.id) : null;
+	return { id, sourceId, thumbnail, canonicalName };
 }
 
 function normalizeCountValue(value: number | null | undefined): number {

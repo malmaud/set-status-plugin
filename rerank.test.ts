@@ -114,11 +114,43 @@ describe("rerankResults", () => {
 		expect(result).toBe(items);
 	});
 
-	it("falls back when indices length does not match", async () => {
+	it("accepts a truncated ranking and appends the rest in original order", async () => {
 		mockRequestUrl.mockResolvedValue({
 			status: 200,
 			json: {
-				content: [{ type: "text", text: "[0, 1]" }],
+				content: [{ type: "text", text: "[2, 0]" }],
+			},
+		});
+
+		const result = await rerankResults("query", items, "sk-test", MODEL);
+		expect(result).toHaveLength(3);
+		expect(result[0].canonicalName).toBe("The God of the Woods");
+		expect(result[1].canonicalName).toBe("The Bible");
+		// Unranked remainder keeps the provider's own ordering.
+		expect(result[2].canonicalName).toBe("God of War");
+	});
+
+	it("accepts a single-index ranking", async () => {
+		mockRequestUrl.mockResolvedValue({
+			status: 200,
+			json: {
+				content: [{ type: "text", text: "[1]" }],
+			},
+		});
+
+		const result = await rerankResults("query", items, "sk-test", MODEL);
+		expect(result.map((r) => r.canonicalName)).toEqual([
+			"God of War",
+			"The Bible",
+			"The God of the Woods",
+		]);
+	});
+
+	it("falls back when the ranking is empty", async () => {
+		mockRequestUrl.mockResolvedValue({
+			status: 200,
+			json: {
+				content: [{ type: "text", text: "[ ]" }],
 			},
 		});
 

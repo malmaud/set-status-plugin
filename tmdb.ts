@@ -9,6 +9,8 @@ const TMDB_BASE_BACKOFF_MS = 1000;
 
 export interface TvShowMetadata {
 	id: string | null;
+	/** TMDB media type and numeric id, e.g. "tv/1396". Stable across retitling. */
+	sourceId: string | null;
 	thumbnail: string | null;
 	canonicalName: string | null;
 }
@@ -99,23 +101,59 @@ export async function fetchTvShowMetadata(
 	showName: string,
 	apiKey: string
 ): Promise<TvShowMetadata | null> {
-	const trimmed = showName.trim();
-	if (!trimmed || !apiKey) {
-		console.info(`${LOG_PREFIX} fetchTvShowMetadata: skipped (empty input or missing key)`);
+	const results = await searchTvShows(showName, apiKey);
+	return results.length > 0 ? results[0] : null;
+}
+
+/**
+ * Look a title up by its TMDB media type and id ("tv/1396", "movie/546554")
+ * rather than by name, so a confirmed match survives a note rename.
+ */
+export async function fetchTvShowById(
+	sourceId: string,
+	apiKey: string
+): Promise<TvShowMetadata | null> {
+	const match = /^(tv|movie)\/(\d+)$/.exec(sourceId.trim());
+	if (!match || !apiKey) {
+		console.warn(`${LOG_PREFIX} fetchTvShowById: invalid id "${sourceId}"`);
 		return null;
 	}
+	const [, mediaType, id] = match;
+	const url = `https://api.themoviedb.org/3/${mediaType}/${id}?${new URLSearchParams({ api_key: apiKey })}`;
+	console.info(`${LOG_PREFIX} fetchTvShowById: ${mediaType}/${id}`);
 
-	const query = stripSeasonSuffix(trimmed);
-	const results = await tmdbSearch(query, apiKey);
-	if (results.length > 0) {
-		return results[0];
-	}
+	for (let attempt = 1; attempt <= TMDB_MAX_RETRIES; attempt++) {
+		try {
+			const response = await requestUrl({
+				url,
+				method: "GET",
+				headers: { Accept: "application/json" },
+				throw: false,
+			});
 
-	const loose = loosen(query);
-	if (loose !== query) {
-		console.info(`${LOG_PREFIX} fetchTvShowMetadata: retrying with loosened query="${loose}"`);
-		const looseResults = await tmdbSearch(loose, apiKey);
-		return looseResults.length > 0 ? looseResults[0] : null;
+			if (response.status >= 400) {
+				if (response.status === 429 && attempt < TMDB_MAX_RETRIES) {
+					await delay(TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
+					continue;
+				}
+				console.error(`${LOG_PREFIX} fetchTvShowById: failed with status ${response.status}`);
+				return null;
+			}
+
+			const data = response.json;
+			if (!data || typeof data.id !== "number") {
+				return null;
+			}
+			// The detail endpoint omits media_type; restore it so the URL is right.
+			return resultToMetadata({ ...data, media_type: mediaType });
+		} catch (error) {
+			console.error(`${LOG_PREFIX} fetchTvShowById: error (attempt ${attempt}):`, error);
+			if (attempt < TMDB_MAX_RETRIES) {
+				await delay(TMDB_BASE_BACKOFF_MS * 2 ** (attempt - 1));
+				continue;
+			}
+			return null;
+		}
 	}
 	return null;
 }
@@ -152,7 +190,8 @@ function resultToMetadata(result: TmdbResult): TvShowMetadata {
 		: null;
 	const mediaPath = result.media_type === "movie" ? "movie" : "tv";
 	const id = typeof result.id === "number" ? `https://www.themoviedb.org/${mediaPath}/${result.id}` : null;
-	return { id, thumbnail, canonicalName };
+	const sourceId = typeof result.id === "number" ? `${mediaPath}/${result.id}` : null;
+	return { id, sourceId, thumbnail, canonicalName };
 }
 
 function safeNum(value: number | null | undefined): number {
